@@ -397,6 +397,97 @@ function cmdBook(argv) {
   return cmdApi(['GET', `/api/v1/polymarket/book/${tokenId}${suffix}`])
 }
 
+// `history <token_id>`: CLOB trade-price history for one outcome token —
+// strategy input, NOT a live quote (use `book` / `market` for that).
+function cmdHistory(argv) {
+  const words = []
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--interval' || argv[i] === '--fidelity') {
+      i++ // skip the flag's value
+      continue
+    }
+    if (argv[i] === '--json') continue
+    words.push(argv[i])
+  }
+  const tokenId = words[0]
+  if (!/^\d+$/.test(tokenId ?? '')) {
+    die(
+      'Usage: oddsbot.mjs history <token_id> [--interval 1h|6h|1d|1w|max] [--fidelity <minutes>] [--json]\n' +
+        'The token_id is the numeric `token_id` from `market <id>` output.',
+    )
+  }
+  const params = new URLSearchParams()
+  const interval = flagValue(argv, '--interval')
+  if (interval) params.set('interval', interval)
+  const fidelity = flagValue(argv, '--fidelity')
+  if (fidelity) params.set('fidelity', fidelity)
+  const suffix = params.size > 0 ? `?${params}` : ''
+  return cmdApi(['GET', `/api/v1/polymarket/history/${tokenId}${suffix}`])
+}
+
+// `events [query]`: search or browse events — the groupings agents reason
+// about ("the Fed meeting"). Same flags and paging as `markets`.
+function cmdEvents(argv) {
+  const words = []
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--limit' || argv[i] === '--cursor' || argv[i] === '--sort') {
+      i++ // skip the flag's value
+      continue
+    }
+    if (argv[i] === '--json') continue
+    words.push(argv[i])
+  }
+  const params = new URLSearchParams()
+  if (words.length > 0) params.set('query', words.join(' '))
+  const limit = flagValue(argv, '--limit')
+  if (limit) params.set('limit', limit)
+  const cursor = flagValue(argv, '--cursor')
+  if (cursor) params.set('cursor', cursor)
+  const sort = flagValue(argv, '--sort')
+  if (sort) params.set('sort', sort)
+  const suffix = params.size > 0 ? `?${params}` : ''
+  return cmdApi(['GET', `/api/v1/polymarket/events${suffix}`])
+}
+
+// `event <id|slug>`: one event with every nested market. Exact lookup —
+// a typo is a 404, never a different event.
+function cmdEvent(argv) {
+  const id = argv[0]
+  if (!id || id.startsWith('-')) {
+    die(
+      'Usage: oddsbot.mjs event <id|slug>\n' +
+        'The id is the `id` field from `events` output (an event slug also works).',
+    )
+  }
+  return cmdApi(['GET', `/api/v1/polymarket/events/${encodeURIComponent(id)}`])
+}
+
+// `positions [--closed | --all] [--limit N] [--offset N]`: open positions
+// with unrealized P&L (default), closed positions with realized P&L, or
+// both. Everything comes from Polymarket's Data API at call time.
+async function cmdPositions(argv) {
+  const params = new URLSearchParams()
+  const limit = flagValue(argv, '--limit')
+  if (limit) params.set('limit', limit)
+  const offset = flagValue(argv, '--offset')
+  if (offset) params.set('offset', offset)
+  const suffix = params.size > 0 ? `?${params}` : ''
+  if (argv.includes('--all')) {
+    const [openRes, closedRes] = await Promise.all([
+      apiFetch('GET', `/api/v1/polymarket/positions${suffix}`),
+      apiFetch('GET', `/api/v1/polymarket/positions/closed${suffix}`),
+    ])
+    const [open, closed] = await Promise.all([openRes.json(), closedRes.json()])
+    process.stdout.write(JSON.stringify({ open, closed }, null, 2) + '\n')
+    if (!openRes.ok || !closedRes.ok) process.exit(1)
+    return
+  }
+  const path = argv.includes('--closed')
+    ? `/api/v1/polymarket/positions/closed${suffix}`
+    : `/api/v1/polymarket/positions${suffix}`
+  return cmdApi(['GET', path])
+}
+
 // `order <token_id> buy|sell <size>@<price>`: places a LIMIT order.
 // `order <token_id> buy|sell <size>@market [--max-slippage <bps>]`: the
 // server prices from the live book and places a marketable limit (FAK) at
@@ -566,7 +657,20 @@ Commands:
                                 bid/ask levels (default 10, max 50) with
                                 cumulative USD depth, midpoint, spread, tick
                                 size, min size, neg_risk
-  positions                     The user's Polymarket positions (read-only)
+  history <token_id> [--interval 1h|6h|1d|1w|max] [--fidelity <min>] [--json]
+                                Trade-price history for one outcome token
+                                (default window 1d) with first/last/change/
+                                high/low. Not a live quote — see \`book\`.
+  events [query] [--limit N] [--cursor C] [--sort trending|newest]
+                                Search events, or list open events by 24h
+                                volume (default) or launch date. Events group
+                                related markets (neg-risk = one wins)
+  event <id|slug>               One event with every nested market row
+  positions [--limit N] [--offset N]
+                                Open positions with unrealized P&L, a summary,
+                                and redeemable=true on resolved markets
+  positions --closed            Closed positions with realized P&L
+  positions --all               Both, as {"open": …, "closed": …}
   order <token_id> buy|sell <size>@<price> [--post-only] [--intent ID]
                                 Place a real-money limit order (requires the
                                 polymarket:trade scope and user confirmation)
@@ -634,8 +738,14 @@ async function main() {
       return cmdMarket(rest)
     case 'book':
       return cmdBook(rest)
+    case 'history':
+      return cmdHistory(rest)
+    case 'events':
+      return cmdEvents(rest)
+    case 'event':
+      return cmdEvent(rest)
     case 'positions':
-      return cmdApi(['GET', '/api/v1/polymarket/positions'])
+      return cmdPositions(rest)
     case 'order':
       return cmdOrder(rest)
     case 'orders':

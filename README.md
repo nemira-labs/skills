@@ -5,7 +5,7 @@ Cursor, Codex, Gemini CLI, …).
 
 | Skill | What it does |
 |---|---|
-| [`oddsbot`](skills/oddsbot) | Trade Polymarket prediction markets through [OddsBot](https://oddsbot.vercel.app) on a user's behalf — balance, market search and detail, order-book depth, real-money limit & market orders under user-approved spend limits, order lifecycle, positions and fills. Zero dependencies, Node 20+. |
+| [`oddsbot`](skills/oddsbot) | Trade Polymarket prediction markets through [OddsBot](https://oddsbot.vercel.app) on a user's behalf — balance, market search and detail, order-book depth, real-money limit & market orders under user-approved spend limits, order lifecycle, event search, price history, positions, P&L and fills. Zero dependencies, Node 20+. |
 
 ## Install
 

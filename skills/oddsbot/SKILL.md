@@ -2,15 +2,16 @@
 name: oddsbot
 description: >-
   Interact with OddsBot on behalf of the user — check their Polymarket
-  wallet balance, search prediction markets, read their positions, place
-  and cancel real-money orders within user-approved spend limits, and call
-  OddsBot APIs. Use when the user asks about their OddsBot account,
-  Polymarket balance, markets, positions, orders or trades, agent
+  wallet balance, search prediction markets and events, read price
+  history, read their positions and P&L, place and cancel real-money
+  orders within user-approved spend limits, and call OddsBot APIs. Use
+  when the user asks about their OddsBot account, Polymarket balance,
+  markets, events, prices, positions, P&L, orders or trades, agent
   registration, or connecting an agent to OddsBot. Requires a one-time
   browser authorization (OAuth device flow) on first use.
 compatibility: Requires Node.js 20+
 metadata:
-  version: "0.9.0"
+  version: "0.10.0"
   author: "OddsBot"
 ---
 
@@ -155,6 +156,31 @@ no OddsBot API endpoint can move funds.
   Returns JSON like
   `{"onboarded":true,"balance_pusd":"12.50","wallet":"0x…","mocked":false}`.
 
+- Find the EVENT first when the user talks about a topic ("the Fed
+  meeting", "the election"): events group related markets, and multi-
+  outcome questions only make sense at event level.
+
+  ```
+  node scripts/oddsbot.mjs events fed
+  node scripts/oddsbot.mjs events --limit 10
+  node scripts/oddsbot.mjs events --limit 10 --sort newest
+  node scripts/oddsbot.mjs events --limit 10 --cursor <next_cursor>
+  node scripts/oddsbot.mjs event 481717
+  node scripts/oddsbot.mjs event fed-decision-in-september
+  ```
+
+  `events` searches active events with a query, or lists open ones by 24h
+  volume (`--sort trending`, default) or launch date (`--sort newest`);
+  paginate with the previous response's `next_cursor`. Each row has `id`,
+  `title`, `slug`, `neg_risk`, `market_count`, `tags`, volume/liquidity and
+  `end_date`. `event <id|slug>` returns the event plus `markets[]` — every
+  nested market in the same row shape as `markets` (including
+  `clob_token_ids` and `neg_risk`). When `neg_risk` is true the markets are
+  mutually-exclusive outcomes of one question: at most one resolves YES,
+  and their YES prices should sum to about 1. A wrong id is
+  `event_not_found` (HTTP 404) — relay `next_action`, never guess another
+  id. Nested `outcome_prices` are cached: run `market <id>` before quoting.
+
 - Search or browse prediction markets:
 
   ```
@@ -230,11 +256,47 @@ no OddsBot API endpoint can move funds.
   that side right now — do not place resting orders against a side you
   cannot see.
 
-- The user's Polymarket positions and portfolio value:
+- Price history for one outcome token (strategy input — how has the
+  price moved?):
+
+  ```
+  node scripts/oddsbot.mjs history <token_id>
+  node scripts/oddsbot.mjs history <token_id> --interval 1w --fidelity 60
+  ```
+
+  `<token_id>` is the `token_id` from `market <id>`. `--interval` is one
+  of `1h`, `6h`, `1d` (default), `1w`, `max`; `--fidelity` is the bucket
+  width in minutes (the server floors it to what the exchange allows —
+  `1w` needs at least 5). Returns `points` (`{t: unix seconds, p: price}`,
+  ascending), `count`, `first`, `last`, `change` (last − first), `high`,
+  `low`. **These are trade prices per bucket, not the live quote** — the
+  `note` field says so. Price an order from `book` / `market`, never from
+  `last.p`. An empty `points` array with a `next_action` means no trades in
+  the window: check the id with `market <id>` or widen to `--interval max`.
+
+- The user's Polymarket positions and P&L:
 
   ```
   node scripts/oddsbot.mjs positions
+  node scripts/oddsbot.mjs positions --closed
+  node scripts/oddsbot.mjs positions --all
+  node scripts/oddsbot.mjs positions --limit 100 --offset 100
   ```
+
+  `positions` lists open positions with a `summary`
+  (`portfolio_value_usd`, `open_count`, `unrealized_pnl_usd`,
+  `redeemable_count`, `redeemable_value_usd`). Each row carries `token_id`
+  (pass it straight to `book`, `history` or `order`), `condition_id`,
+  `market`, `outcome`, `size`, `avg_price`, `current_price`,
+  `current_value_usd`, `pnl_usd` / `pnl_percent` (unrealized), `end_date`,
+  `neg_risk`, and `redeemable`. `redeemable: true` means the market has
+  resolved: the row (and the response) carries a `next_action` — relay it.
+  **Agents cannot redeem**; the user redeems on their dashboard in the
+  browser, where the resolution is verified on-chain before anything is
+  signed. `--closed` lists closed positions with `realized_pnl_usd`,
+  `exit_price`, `closed_at` and a `summary.realized_pnl_usd`; `--all`
+  returns `{"open": …, "closed": …}`. All numbers come from Polymarket's
+  Data API at call time — OddsBot keeps no position ledger of its own.
 
 - Place a limit order (see the trading safety contract above — confirm in
   chat first; requires the `polymarket:trade` scope):
