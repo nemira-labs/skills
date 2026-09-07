@@ -45,11 +45,11 @@ function detectHarness() {
 }
 
 const HARNESS = detectHarness()
-const CRED_DIR = join(homedir(), '.oddsbot')
+const CRED_DIR = process.env.ODDSBOT_STATE_DIR || join(homedir(), '.oddsbot')
 // Pre-rebrand location (the skill shipped as "polyedge" until 0.8.x). Moved
 // wholesale, once, so existing logins survive the rename.
 const PRE_REBRAND_CRED_DIR = join(homedir(), '.polyedge')
-if (existsSync(PRE_REBRAND_CRED_DIR) && !existsSync(CRED_DIR)) {
+if (!process.env.ODDSBOT_STATE_DIR && existsSync(PRE_REBRAND_CRED_DIR) && !existsSync(CRED_DIR)) {
   try {
     renameSync(PRE_REBRAND_CRED_DIR, CRED_DIR)
   } catch {
@@ -85,7 +85,9 @@ function readJsonFile(path) {
 
 function writeJsonFile(path, data) {
   mkdirSync(CRED_DIR, { recursive: true, mode: 0o700 })
-  writeFileSync(path, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 })
+  const temporary = `${path}.${process.pid}.tmp`
+  writeFileSync(temporary, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 })
+  renameSync(temporary, path)
 }
 
 function removeFile(path) {
@@ -139,6 +141,9 @@ async function refreshCredentials() {
     grant_type: 'refresh_token',
     refresh_token: creds.refresh_token,
   })
+  if (status >= 500 || status === 429) {
+    die('OddsBot is temporarily unavailable. Your connection is saved; try again shortly.')
+  }
   if (status !== 200 || !data?.access_token) {
     removeFile(CRED_PATH)
     die42()
@@ -164,6 +169,7 @@ function saveTokenResponse(existing, data) {
 async function ensureAccessToken() {
   let creds = readJsonFile(CRED_PATH)
   if (!creds?.access_token) die42()
+  if (creds.api_base?.replace(/\/$/, '') !== apiBase()) die42()
   const expiresAt = Date.parse(creds.access_token_expires_at ?? '') || 0
   if (expiresAt - 30_000 < Date.now()) {
     creds = await refreshCredentials()
@@ -201,7 +207,7 @@ async function cmdStatus() {
   if (!creds) die42()
   const response = await apiFetch('GET', '/api/v1/me')
   const me = await response.json().catch(() => null)
-  if (!response.ok || !me) die42()
+  if (!response.ok || !me) die('Could not verify the OddsBot connection. Try again shortly.')
   console.log(
     JSON.stringify(
       {
@@ -223,6 +229,15 @@ async function cmdStatus() {
 const DEFAULT_SCOPES = ['profile:read', 'wallet:read', 'polymarket:read']
 
 async function cmdLoginStart(withTrade = false) {
+  const pending = readJsonFile(PENDING_PATH)
+  if (
+    pending?.api_base === apiBase() &&
+    Date.parse(pending.expires_at) > Date.now() &&
+    pending.with_trade === withTrade &&
+    pending.verification_uri_complete
+  ) {
+    return printPending(pending)
+  }
   const { status, data } = await post('/api/agent-auth/device', {
     client_name: `${HARNESS}@${hostname()}`,
     harness: HARNESS,
@@ -234,18 +249,27 @@ async function cmdLoginStart(withTrade = false) {
   if (status !== 200 || !data?.device_code) {
     die(`Failed to start device authorization: ${JSON.stringify(data)}`)
   }
-  writeJsonFile(PENDING_PATH, {
+  const next = {
     api_base: apiBase(),
     device_code: data.device_code,
     interval: data.interval ?? 5,
     expires_at: new Date(Date.now() + data.expires_in * 1000).toISOString(),
-  })
+    verification_uri_complete: data.verification_uri_complete,
+    user_code: data.user_code,
+    with_trade: withTrade,
+    next_poll_at: Date.now() + (data.interval ?? 5) * 1000,
+  }
+  writeJsonFile(PENDING_PATH, next)
+  printPending(next)
+}
+
+function printPending(pending) {
   console.log(
     JSON.stringify(
       {
-        verification_uri_complete: data.verification_uri_complete,
-        user_code: data.user_code,
-        expires_in: data.expires_in,
+        verification_uri_complete: pending.verification_uri_complete,
+        user_code: pending.user_code,
+        expires_in: Math.max(0, Math.ceil((Date.parse(pending.expires_at) - Date.now()) / 1000)),
         next_step:
           'Ask the user to open the URL and approve, then run `oddsbot.mjs login --wait`.',
       },
@@ -255,11 +279,47 @@ async function cmdLoginStart(withTrade = false) {
   )
 }
 
+async function cmdLoginPoll() {
+  const pending = readJsonFile(PENDING_PATH)
+  if (!pending?.device_code || pending.api_base !== apiBase()) {
+    console.log(JSON.stringify({ authenticated: false, state: 'not_started' }))
+    return
+  }
+  if (Date.parse(pending.expires_at) <= Date.now()) {
+    removeFile(PENDING_PATH)
+    console.log(JSON.stringify({ authenticated: false, state: 'expired' }))
+    return
+  }
+  if (pending.next_poll_at > Date.now()) {
+    console.log(JSON.stringify({ authenticated: false, state: 'pending', retry_after_seconds: Math.ceil((pending.next_poll_at - Date.now()) / 1000) }))
+    return
+  }
+  const { status, data } = await post('/api/agent-auth/token', {
+    grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+    device_code: pending.device_code,
+  })
+  if (status === 200 && data?.access_token) {
+    saveTokenResponse({ api_base: pending.api_base }, data)
+    removeFile(PENDING_PATH)
+    console.log(JSON.stringify({ authenticated: true, state: 'connected', scopes: (data.scope ?? '').split(' ') }))
+    return
+  }
+  const interval = (pending.interval ?? 5) + (data?.error === 'slow_down' ? 5 : 0)
+  if (['authorization_pending', 'slow_down'].includes(data?.error) || status >= 500) {
+    writeJsonFile(PENDING_PATH, { ...pending, interval, next_poll_at: Date.now() + interval * 1000 })
+    console.log(JSON.stringify({ authenticated: false, state: 'pending', retry_after_seconds: interval }))
+    return
+  }
+  removeFile(PENDING_PATH)
+  console.log(JSON.stringify({ authenticated: false, state: data?.error === 'access_denied' ? 'denied' : 'expired' }))
+}
+
 async function cmdLoginWait() {
   const pending = readJsonFile(PENDING_PATH)
   if (!pending?.device_code) {
     die('No pending device authorization. Run `oddsbot.mjs login --no-poll` first.')
   }
+  if (pending.api_base !== apiBase()) die('Pending authorization belongs to another OddsBot server. Restart login.')
   let interval = (pending.interval ?? 5) * 1000
   const expiresAt = Date.parse(pending.expires_at ?? '') || Date.now() + 900_000
 
@@ -304,22 +364,39 @@ async function cmdLoginWait() {
   die('The device code expired before approval. Restart the login flow.')
 }
 
-function cmdLogout() {
+// Logout revokes the grant server-side (RFC 7009, by refresh token) before
+// deleting local state, so a logged-out credential file is dead even if a
+// copy of it exists somewhere. Best-effort: offline still logs out locally.
+async function cmdLogout() {
+  const creds = readJsonFile(CRED_PATH)
+  let serverRevoked = false
+  if (creds?.refresh_token) {
+    try {
+      const response = await fetch(apiBase() + '/api/agent-auth/revoke', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: creds.refresh_token }),
+      })
+      const data = await response.json().catch(() => null)
+      serverRevoked = response.ok && data?.revoked === true
+    } catch {
+      // offline: local logout still proceeds
+    }
+  }
   removeFile(CRED_PATH)
   removeFile(PENDING_PATH)
-  console.log(JSON.stringify({ logged_out: true }))
+  console.log(JSON.stringify({ logged_out: true, server_revoked: serverRevoked }))
 }
 
 async function cmdApi(argv) {
-  const [method, path] = argv
+  const [method, path, rawBody] = argv
   if (!method || !path?.startsWith('/')) {
     die('Usage: oddsbot.mjs api <METHOD> </path> [--json \'<body>\']')
   }
-  const jsonFlagIndex = argv.indexOf('--json')
   let body
-  if (jsonFlagIndex !== -1) {
+  if (rawBody !== undefined) {
     try {
-      body = JSON.parse(argv[jsonFlagIndex + 1])
+      body = JSON.parse(rawBody)
     } catch {
       die('--json value is not valid JSON')
     }
@@ -338,7 +415,7 @@ function flagValue(argv, flag) {
 async function cmdMarkets(argv) {
   const words = []
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--limit' || argv[i] === '--cursor' || argv[i] === '--sort') {
+    if (argv[i] === '--limit' || argv[i] === '--cursor' || argv[i] === '--sort' || argv[i] === '--tag') {
       i++ // skip the flag's value
       continue
     }
@@ -352,6 +429,8 @@ async function cmdMarkets(argv) {
   if (cursor) params.set('cursor', cursor)
   const sort = flagValue(argv, '--sort')
   if (sort) params.set('sort', sort)
+  const tag = flagValue(argv, '--tag')
+  if (tag) params.set('tag', tag)
   const suffix = params.size > 0 ? `?${params}` : ''
   return cmdApi(['GET', `/api/v1/polymarket/markets${suffix}`])
 }
@@ -430,11 +509,10 @@ function cmdHistory(argv) {
 function cmdEvents(argv) {
   const words = []
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--limit' || argv[i] === '--cursor' || argv[i] === '--sort') {
+    if (argv[i] === '--limit' || argv[i] === '--cursor' || argv[i] === '--sort' || argv[i] === '--tag') {
       i++ // skip the flag's value
       continue
     }
-    if (argv[i] === '--json') continue
     words.push(argv[i])
   }
   const params = new URLSearchParams()
@@ -445,6 +523,8 @@ function cmdEvents(argv) {
   if (cursor) params.set('cursor', cursor)
   const sort = flagValue(argv, '--sort')
   if (sort) params.set('sort', sort)
+  const tag = flagValue(argv, '--tag')
+  if (tag) params.set('tag', tag)
   const suffix = params.size > 0 ? `?${params}` : ''
   return cmdApi(['GET', `/api/v1/polymarket/events${suffix}`])
 }
@@ -506,12 +586,12 @@ async function cmdOrder(argv) {
       i++ // optional explicit timeout in ms
       continue
     }
-    if (argv[i] === '--post-only' || argv[i] === '--wait') continue
+    if (argv[i] === '--post-only' || argv[i] === '--wait' || argv[i] === '--allow-off-market') continue
     words.push(argv[i])
   }
   const [tokenId, side, sizeAtPrice] = words
   const usage =
-    'Usage: oddsbot.mjs order <token_id> buy|sell <size>@<price> [--post-only] [--intent ID] [--wait [ms]]\n' +
+    'Usage: oddsbot.mjs order <token_id> buy|sell <size>@<price> [--post-only] [--allow-off-market] [--intent ID] [--wait [ms]]\n' +
     '       oddsbot.mjs order <token_id> buy|sell <size>@market [--max-slippage <bps>] [--intent ID] [--wait [ms]]\n' +
     'Examples: order 1234567890 buy 5@0.35   (limit: 5 shares at $0.35 each)\n' +
     '          order 1234567890 buy 5@market --max-slippage 50\n' +
@@ -540,6 +620,9 @@ async function cmdOrder(argv) {
     if (argv.includes('--post-only')) {
       die('--post-only cannot be combined with @market (market orders exist to match immediately)')
     }
+    if (argv.includes('--allow-off-market')) {
+      die('--allow-off-market applies to limit orders only (market orders are bounded by --max-slippage)')
+    }
     const maxSlippage = flagValue(argv, '--max-slippage')
     if (maxSlippage !== undefined && !/^\d+$/.test(maxSlippage)) {
       die('--max-slippage takes whole basis points, e.g. --max-slippage 50 for 0.5%')
@@ -547,7 +630,6 @@ async function cmdOrder(argv) {
     return cmdApi([
       'POST',
       '/api/v1/polymarket/orders',
-      '--json',
       JSON.stringify({
         type: 'market',
         intent_id: intentId,
@@ -564,7 +646,6 @@ async function cmdOrder(argv) {
   return cmdApi([
     'POST',
     '/api/v1/polymarket/orders',
-    '--json',
     JSON.stringify({
       intent_id: intentId,
       token_id: tokenId,
@@ -572,9 +653,127 @@ async function cmdOrder(argv) {
       size: Number(limitMatch[1]),
       price: Number(limitMatch[2]),
       post_only: argv.includes('--post-only'),
+      // Audited opt-out of the server's fat-finger check (price far through
+      // the live midpoint). Only when the user explicitly wants that price.
+      ...(argv.includes('--allow-off-market') ? { override_price_sanity: true } : {}),
       ...waitForFill,
     }),
   ])
+}
+
+// `approval-status <approval_id>`: state of an order the server held for
+// the user's out-of-band approval (HTTP 202 from `order`). Poll this; the
+// user decides on their dashboard — the agent cannot approve.
+function cmdApprovalStatus(argv) {
+  const id = argv[0]
+  if (!/^apr_[0-9a-f-]{36}$/.test(id ?? '')) {
+    die('Usage: oddsbot.mjs approval-status <approval_id>   (ids start with apr_, from the order response)')
+  }
+  return cmdApi(['GET', `/api/v1/polymarket/approvals/${id}`])
+}
+
+// --- analytics (first-party Data API reads) ---
+
+function cmdHolders(argv) {
+  const cond = argv.find((a) => !a.startsWith('-'))
+  if (!/^0x[0-9a-fA-F]{64}$/.test(cond ?? '')) {
+    die('Usage: oddsbot.mjs holders <condition_id> [--limit N]   (0x… condition_id from `market <id>`)')
+  }
+  const limit = flagValue(argv, '--limit')
+  return cmdApi(['GET', `/api/v1/polymarket/analytics/holders/${cond}${limit ? `?limit=${encodeURIComponent(limit)}` : ''}`])
+}
+
+function cmdOpenInterest(argv) {
+  const cond = argv[0]
+  if (!/^0x[0-9a-fA-F]{64}$/.test(cond ?? '')) {
+    die('Usage: oddsbot.mjs open-interest <condition_id>   (0x… condition_id from `market <id>`)')
+  }
+  return cmdApi(['GET', `/api/v1/polymarket/analytics/open-interest/${cond}`])
+}
+
+function cmdLiveVolume(argv) {
+  const id = argv[0]
+  if (!/^\d+$/.test(id ?? '')) {
+    die('Usage: oddsbot.mjs live-volume <event_id>   (numeric id from `events`)')
+  }
+  return cmdApi(['GET', `/api/v1/polymarket/analytics/live-volume/${id}`])
+}
+
+function cmdLeaderboard(argv) {
+  const params = new URLSearchParams()
+  const window = flagValue(argv, '--window')
+  if (window !== undefined) {
+    if (!['1d', '7d', '30d', 'all'].includes(window)) die('--window must be 1d, 7d, 30d or all')
+    params.set('window', window)
+  }
+  const by = flagValue(argv, '--by')
+  if (by !== undefined) {
+    if (!['pnl', 'vol'].includes(by)) die('--by must be pnl or vol')
+    params.set('by', by)
+  }
+  const category = flagValue(argv, '--category')
+  if (category !== undefined) params.set('category', category)
+  const limit = flagValue(argv, '--limit')
+  if (limit !== undefined) params.set('limit', limit)
+  return cmdApi(['GET', `/api/v1/polymarket/analytics/leaderboard${params.size ? `?${params}` : ''}`])
+}
+
+function cmdPortfolio(argv) {
+  const address = argv.find((a) => !a.startsWith('-'))
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address ?? '')) {
+    die('Usage: oddsbot.mjs portfolio <0x address> [--limit N]   (any wallet, e.g. from `leaderboard`)')
+  }
+  const limit = flagValue(argv, '--limit')
+  return cmdApi(['GET', `/api/v1/polymarket/analytics/portfolio/${address}${limit ? `?limit=${encodeURIComponent(limit)}` : ''}`])
+}
+
+// --- discovery (Gamma tags / series / sports) ---
+
+function cmdTags(argv) {
+  const words = []
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--limit' || argv[i] === '--cursor') {
+      i++
+      continue
+    }
+    words.push(argv[i])
+  }
+  const params = new URLSearchParams()
+  if (words.length > 0) params.set('query', words.join(' '))
+  const limit = flagValue(argv, '--limit')
+  if (limit) params.set('limit', limit)
+  const cursor = flagValue(argv, '--cursor')
+  if (cursor) params.set('cursor', cursor)
+  return cmdApi(['GET', `/api/v1/polymarket/tags${params.size ? `?${params}` : ''}`])
+}
+
+function cmdTag(argv) {
+  const id = argv.find((a) => !a.startsWith('-'))
+  if (!id) die('Usage: oddsbot.mjs tag <slug|id> [--limit N]   (e.g. `tag nba`)')
+  const limit = flagValue(argv, '--limit')
+  return cmdApi(['GET', `/api/v1/polymarket/tags/${encodeURIComponent(id)}${limit ? `?limit=${encodeURIComponent(limit)}` : ''}`])
+}
+
+function cmdSeries(argv) {
+  const id = argv.find((a) => !a.startsWith('-'))
+  const limit = flagValue(argv, '--limit')
+  const cursor = flagValue(argv, '--cursor')
+  if (id) {
+    return cmdApi(['GET', `/api/v1/polymarket/series/${encodeURIComponent(id)}${limit ? `?limit=${encodeURIComponent(limit)}` : ''}`])
+  }
+  const params = new URLSearchParams()
+  if (limit) params.set('limit', limit)
+  if (cursor) params.set('cursor', cursor)
+  return cmdApi(['GET', `/api/v1/polymarket/series${params.size ? `?${params}` : ''}`])
+}
+
+function cmdTeams(argv) {
+  const league = argv.find((a) => !a.startsWith('-'))
+  if (!league) die('Usage: oddsbot.mjs teams <league> [--limit N]   (league slug from `sports`, e.g. nfl)')
+  const limit = flagValue(argv, '--limit')
+  const params = new URLSearchParams({ league })
+  if (limit) params.set('limit', limit)
+  return cmdApi(['GET', `/api/v1/polymarket/sports/teams?${params}`])
 }
 
 function cmdCancel(argv) {
@@ -625,7 +824,6 @@ function cmdHeartbeat(argv) {
   return cmdApi([
     'POST',
     '/api/v1/polymarket/heartbeat',
-    '--json',
     JSON.stringify(ttl !== undefined ? { ttl_sec: Number(ttl) } : {}),
   ])
 }
@@ -639,6 +837,7 @@ Commands:
   login                         Start device authorization and wait for approval
   login --no-poll               Start device authorization, print URL + code, exit
   login --wait                  Poll until the pending authorization is approved
+  login --poll-once             Check pending authorization once without blocking
   login --trade                 Include the polymarket:trade scope in the request
                                 (combinable with --no-poll; needs the user's
                                 explicit agreement FIRST — see SKILL.md)
@@ -646,9 +845,10 @@ Commands:
   api <METHOD> </path> [--json '<body>']
                                 Authenticated API call, response body to stdout
   balance                       Real pUSD balance of the user's Polymarket wallet
-  markets [query] [--limit N] [--cursor C] [--sort trending|newest|all]
+  markets [query] [--limit N] [--cursor C] [--sort trending|newest|all] [--tag <slug>]
                                 Search markets, or list them sorted by 24h
-                                volume (default), launch date, or unsorted
+                                volume (default), launch date, or unsorted;
+                                --tag narrows a sorted listing to one category
   market <id>                   One market in detail: metadata plus live
                                 order-book quotes (bid/ask/mid/spread, tick
                                 size, min size, fees, neg_risk) per outcome
@@ -661,11 +861,29 @@ Commands:
                                 Trade-price history for one outcome token
                                 (default window 1d) with first/last/change/
                                 high/low. Not a live quote — see \`book\`.
-  events [query] [--limit N] [--cursor C] [--sort trending|newest]
+  events [query] [--limit N] [--cursor C] [--sort trending|newest] [--tag <slug>]
                                 Search events, or list open events by 24h
                                 volume (default) or launch date. Events group
                                 related markets (neg-risk = one wins)
   event <id|slug>               One event with every nested market row
+  tags [query] [--limit N] [--cursor C]
+                                Categories: ranked tags for a query, or an
+                                alphabetical page of the tag catalogue
+  tag <slug|id> [--limit N]     One tag: related tags + its top open events
+  series [<slug|id>] [--limit N] [--cursor C]
+                                Recurring series (nfl, league-of-legends, …)
+                                by 24h volume; with an id, its open events
+  sports                        Every league with its tag/series ids
+  teams <league> [--limit N]    Teams of one league (slug from \`sports\`)
+  holders <condition_id> [--limit N]
+                                Top holders per outcome token of a market
+  open-interest <condition_id>  Open interest (USD) of a market
+  live-volume <event_id>        In-play volume of an event, per market
+  leaderboard [--window 1d|7d|30d|all] [--by pnl|vol] [--category <tag>] [--limit N]
+                                Polymarket's public trader leaderboard
+  portfolio <0x address> [--limit N]
+                                Any wallet's public profile, value and top
+                                open positions
   positions [--limit N] [--offset N]
                                 Open positions with unrealized P&L, a summary,
                                 and redeemable=true on resolved markets
@@ -673,7 +891,11 @@ Commands:
   positions --all               Both, as {"open": …, "closed": …}
   order <token_id> buy|sell <size>@<price> [--post-only] [--intent ID]
                                 Place a real-money limit order (requires the
-                                polymarket:trade scope and user confirmation)
+                                polymarket:trade scope and user confirmation).
+                                Priced far through the live midpoint → refused
+                                (price_sanity) unless --allow-off-market, which
+                                is audited; use it only when the user asked for
+                                exactly that price.
   order <token_id> buy|sell <size>@market [--max-slippage <bps>] [--intent ID]
                                 Market order: the server prices it from the
                                 live book and places a marketable limit (FAK)
@@ -686,6 +908,11 @@ Commands:
                                 on-chain; the response then carries
                                 "settlement" with the tx hashes. A timeout
                                 never un-places the order.
+                                HTTP 202 / "pending_approval": the order is
+                                above the user's confirmation threshold and
+                                held until they approve it on their dashboard.
+  approval-status <approval_id> State of a held order (pending / placed /
+                                rejected / expired) — poll after a 202
   orders                        The user's open orders
   order-status <order_id>       One order's live state: status, size matched /
                                 remaining, trade ids — poll this instead of
@@ -708,20 +935,24 @@ Environment:
                                 use http://localhost:3000 for local dev)
   ODDSBOT_HARNESS              Override the detected harness name (this run:
                                 ${HARNESS})
+  ODDSBOT_STATE_DIR            Isolated credential directory for integrations
 
 Credentials are stored per harness in ~/.oddsbot/credentials.<harness>.json
 (0600) — each harness the skill runs in is a separate OddsBot agent with its
-own name and grant. Logout only clears local state; server-side revocation is
-managed in the OddsBot web app.`
+own name and grant. Logout revokes the grant server-side (best effort) and
+clears local state; the user can also revoke any grant in the OddsBot web app.`
 
 async function main() {
-  const [command, ...rest] = process.argv.slice(2)
+  // Every command prints JSON on stdout and prose on stderr; --json is
+  // accepted anywhere for uniformity and means nothing extra.
+  const [command, ...rest] = process.argv.slice(2).filter((arg) => arg !== '--json')
   switch (command) {
     case 'status':
       return cmdStatus()
     case 'login': {
       const withTrade = rest.includes('--trade')
       if (rest.includes('--no-poll')) return cmdLoginStart(withTrade)
+      if (rest.includes('--poll-once')) return cmdLoginPoll()
       if (rest.includes('--wait')) return cmdLoginWait()
       await cmdLoginStart(withTrade)
       return cmdLoginWait()
@@ -748,6 +979,30 @@ async function main() {
       return cmdPositions(rest)
     case 'order':
       return cmdOrder(rest)
+    case 'approval-status':
+      return cmdApprovalStatus(rest)
+    case 'approvals':
+      return cmdApi(['GET', '/api/v1/polymarket/approvals'])
+    case 'holders':
+      return cmdHolders(rest)
+    case 'open-interest':
+      return cmdOpenInterest(rest)
+    case 'live-volume':
+      return cmdLiveVolume(rest)
+    case 'leaderboard':
+      return cmdLeaderboard(rest)
+    case 'portfolio':
+      return cmdPortfolio(rest)
+    case 'tags':
+      return cmdTags(rest)
+    case 'tag':
+      return cmdTag(rest)
+    case 'series':
+      return cmdSeries(rest)
+    case 'sports':
+      return cmdApi(['GET', '/api/v1/polymarket/sports'])
+    case 'teams':
+      return cmdTeams(rest)
     case 'orders':
       return cmdApi(['GET', '/api/v1/polymarket/orders'])
     case 'order-status':

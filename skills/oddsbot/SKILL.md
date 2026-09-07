@@ -2,17 +2,26 @@
 name: oddsbot
 description: >-
   Interact with OddsBot on behalf of the user — check their Polymarket
-  wallet balance, search prediction markets and events, read price
-  history, read their positions and P&L, place and cancel real-money
-  orders within user-approved spend limits, and call OddsBot APIs. Use
-  when the user asks about their OddsBot account, Polymarket balance,
-  markets, events, prices, positions, P&L, orders or trades, agent
-  registration, or connecting an agent to OddsBot. Requires a one-time
-  browser authorization (OAuth device flow) on first use.
+  wallet balance, search prediction markets, events, tags, series and
+  sports, read price history, top holders, open interest and the trader
+  leaderboard, read their positions and P&L, place and cancel real-money
+  orders within user-approved spend limits and risk guardrails, and call
+  OddsBot APIs. Use when the user asks about their OddsBot account,
+  Polymarket balance, markets, events, prices, positions, P&L, orders or
+  trades, agent registration, or connecting an agent to OddsBot. Requires
+  a one-time browser authorization (OAuth device flow) on first use.
 compatibility: Requires Node.js 20+
 metadata:
-  version: "0.10.0"
+  version: "0.11.0"
   author: "OddsBot"
+  # Machine-readable install requirements (harness compatibility checks).
+  requires:
+    bins: ["node"]
+    node: ">=20"
+    network: ["https://oddsbot.vercel.app"]
+    env:
+      optional: ["ODDSBOT_API_URL", "ODDSBOT_HARNESS", "ODDSBOT_STATE_DIR"]
+  oauth_metadata: "/.well-known/oauth-authorization-server"
 ---
 
 # OddsBot
@@ -37,6 +46,12 @@ their browser.
 - Never ask the user for passwords, one-time codes, or tokens in chat. The
   only thing you ever relay is the verification URL and user code printed by
   the login command.
+- Every error from a money-moving command carries `state` and
+  `next_action`. `state: "nothing_placed"` means the exchange never saw the
+  order — safe to fix and resubmit with a NEW intent id; `state: "unknown"`
+  means it may have — re-run with the SAME `--intent` id (the server
+  replays the recorded outcome) or check `orders` before doing anything
+  else. Always relay `next_action` to the user; never improvise past it.
 
 ## Trading safety contract (MANDATORY)
 
@@ -83,6 +98,51 @@ The `order` command spends the user's real money. These rules are absolute:
   order on the account. Prefer `--token` / `--market` scoping, and confirm
   an unscoped cancel-all in chat first unless the user asked for exactly
   that.
+- **Guardrail refusals are final.** Besides the spend limits, the server
+  enforces the user's risk guardrails on every order and refuses with one
+  of: `trading_paused` (the user hit the kill switch — stop trading, say
+  so, do not poll for it to lift), `loss_cap_exceeded` (the day's realized
+  losses reached the user's limit — stop for the day, never "win it
+  back"), `concentration_exceeded` (too much of the account in one market
+  — do not spread the same bet across intents), `price_sanity` (see
+  below). None of these can be worked around from the agent side, and
+  every attempt is audited.
+- **Off-market prices need the user's explicit words.** A limit order
+  priced far through the live midpoint (buying way above / selling way
+  below, default 20%) is refused as `price_sanity` because that is what a
+  price/size or YES/NO mix-up looks like. Re-check `market <id>` and
+  re-price. Only if the user has explicitly said they want that exact
+  price, re-run with `--allow-off-market` — the override is recorded in
+  the audit trail with the order.
+- **A held order is not a placed order.** When an order is above the
+  user's confirmation threshold the server answers HTTP 202
+  `pending_approval` with an `approval.approval_id`: nothing was placed.
+  Tell the user to approve or reject it on their OddsBot dashboard (a
+  browser page — you cannot approve it, and a chat "yes" is not an
+  approval), then poll `approval-status <approval_id>`. Never resubmit,
+  resize, or route the same order elsewhere while it is pending; a
+  `rejected` or `expired` result ends it.
+
+## Limitations (state these when relevant)
+
+- **Geography.** Polymarket restricts trading in some jurisdictions (the
+  US among them). OddsBot does not lift that; a user who cannot trade on
+  polymarket.com cannot trade through an agent either.
+- **Limit and FAK only.** Orders are limit orders, or fill-and-kill
+  marketable limits for `@market`. There is no guaranteed fill: a thin
+  book refuses the order rather than filling it badly.
+- **Relayer tiers.** Gasless on-chain actions (onboarding approvals,
+  redemption, withdrawal) go through Polymarket's relayer, which
+  rate-limits per tier. They are webapp-only and human-signed; the agent
+  never performs them.
+- **Data freshness.** Positions, P&L, holders and leaderboards are
+  Polymarket Data API reads and can lag fills by a minute or more; only
+  `market` / `book` are live exchange quotes. The loss limit is computed
+  from that same data.
+- **Hosted heartbeat.** The dead-man's switch needs a persistent process;
+  the hosted service may answer `503 heartbeat_unavailable`.
+- **Funding.** No API endpoint can deposit, withdraw, or redeem. Those are
+  webapp-only by design.
 
 ## Configuration
 
@@ -170,8 +230,9 @@ no OddsBot API endpoint can move funds.
   ```
 
   `events` searches active events with a query, or lists open ones by 24h
-  volume (`--sort trending`, default) or launch date (`--sort newest`);
-  paginate with the previous response's `next_cursor`. Each row has `id`,
+  volume (`--sort trending`, default) or launch date (`--sort newest`),
+  optionally narrowed to one category with `--tag <slug>` (from `tags` /
+  `sports`); paginate with the previous response's `next_cursor`. Each row has `id`,
   `title`, `slug`, `neg_risk`, `market_count`, `tags`, volume/liquidity and
   `end_date`. `event <id|slug>` returns the event plus `markets[]` — every
   nested market in the same row shape as `markets` (including
@@ -194,7 +255,8 @@ no OddsBot API endpoint can move funds.
   still-tradable markets: `--sort trending` (default) ranks by 24-hour
   volume — use it to answer "what's popular right now / where could I
   bet"; `--sort newest` lists recently launched markets; `--sort all`
-  walks every open market unsorted. Paginate any mode by passing the
+  walks every open market unsorted; `--tag <slug>` narrows a sorted
+  listing to one category. Paginate any mode by passing the
   previous response's `next_cursor` as `--cursor`. Each market includes
   `question`, `outcomes`, `outcome_prices` (0–1 probabilities),
   `clob_token_ids` (the order-book token id for each outcome, same index
@@ -202,6 +264,60 @@ no OddsBot API endpoint can move funds.
   `outcome_prices` here are cached Gamma values for ranking and display
   only — before quoting or trading a market, run `market <id>` for live
   order-book prices.
+
+- Find the right category first for "what NBA / politics / crypto markets
+  are live" questions — tags, series and sports are Polymarket's own
+  grouping, so a tag slug beats guessing search words:
+
+  ```
+  node scripts/oddsbot.mjs tags nba
+  node scripts/oddsbot.mjs tags --limit 50 --cursor <next_cursor>
+  node scripts/oddsbot.mjs tag nba
+  node scripts/oddsbot.mjs series
+  node scripts/oddsbot.mjs series nfl
+  node scripts/oddsbot.mjs sports
+  node scripts/oddsbot.mjs teams nfl
+  node scripts/oddsbot.mjs events --tag nba --limit 10
+  node scripts/oddsbot.mjs markets --tag politics --limit 10
+  ```
+
+  `tags <query>` ranks the tags carried by matching active events
+  (`matches_query: true` marks direct hits); without a query it pages the
+  alphabetical catalogue. `tag <slug|id>` returns the tag, its
+  `related_tags`, and its top open `events` (same rows as `events`).
+  `series` lists recurring series by 24h volume; `series <slug|id>` adds
+  the open events. `sports` lists every league with its `league` slug,
+  `tag_id` and `series_id`; `teams <league>` lists that league's teams
+  (name, abbreviation, record) so you can match a user's team name to a
+  market question. A wrong slug is `tag_not_found` / `series_not_found`
+  (HTTP 404) — relay `next_action`, never guess another.
+
+- Market analytics (first-party Data API reads; all strategy input, none
+  of it a live quote):
+
+  ```
+  node scripts/oddsbot.mjs holders <condition_id>
+  node scripts/oddsbot.mjs holders <condition_id> --limit 25
+  node scripts/oddsbot.mjs open-interest <condition_id>
+  node scripts/oddsbot.mjs live-volume <event_id>
+  node scripts/oddsbot.mjs leaderboard
+  node scripts/oddsbot.mjs leaderboard --window 30d --by vol --category politics --limit 10
+  node scripts/oddsbot.mjs portfolio <0x address>
+  ```
+
+  `<condition_id>` is the 0x… `condition_id` from `market <id>` (or a
+  positions row). `holders` returns, per outcome `token_id`, the largest
+  holders (`wallet`, public `name` or pseudonym, `shares`, `outcome_index`).
+  `open-interest` is the USD notional outstanding on the market
+  (`market_not_found` if the Data API does not know the id — it never
+  substitutes the global figure). `live-volume <event_id>` is in-play
+  volume per market of an event. `leaderboard` is Polymarket's public
+  trader ranking: `--window` 1d|7d|30d|all (default 7d), `--by` pnl|vol
+  (default pnl), optional `--category <tag slug>`; rows carry `wallet`,
+  `pnl_usd`, `volume_usd`. `portfolio <address>` is any wallet's public
+  profile, `portfolio_value_usd`, `markets_traded` and `top_positions` —
+  use it to look at a leaderboard trader's book. Present all of this as
+  what other traders are doing, not as a recommendation.
 
 - Inspect ONE market in detail before trading it (metadata + live quotes):
 
@@ -310,8 +426,39 @@ no OddsBot API endpoint can move funds.
   same `market <id>` quote. `5@0.35` means 5 shares at $0.35 —
   worst-case cost $1.75. Add `--post-only` to guarantee the order only
   rests in the book (it is rejected instead of matching immediately).
-  Success returns `order_id` and CLOB `status`; `spend_limit_exceeded`
-  (HTTP 403) returns the user's current limits — relay them, never retry.
+  Success returns `order_id` and CLOB `status`.
+
+  **Refusals** (nothing placed, all audited; each carries `reason`,
+  `state: "nothing_placed"` and `next_action`):
+
+  | HTTP | `error` | Meaning |
+  |---|---|---|
+  | 403 | `spend_limit_exceeded` | per-order / daily / account cap; response includes `limits` — relay, never retry |
+  | 403 | `trading_paused` | the user's kill switch is on — stop, tell the user |
+  | 403 | `loss_cap_exceeded` | the day's realized loss reached the user's limit — stop for the day |
+  | 403 | `concentration_exceeded` | too much of the account would sit in this one market |
+  | 422 | `price_sanity` | price is far through the live midpoint — re-price, or `--allow-off-market` only on the user's explicit say-so |
+  | 422 | `market_rejected` | tick / min size / no book / (market orders) slippage or depth |
+  | 202 | `pending_approval` | above the user's confirmation threshold — held for the human, see below |
+  | 502 | `order_failed` | the exchange rejected it (`state: nothing_placed`) or the request died in flight (`state: unknown` — replay the SAME intent id) |
+
+- Held for the user's approval (HTTP 202):
+
+  ```
+  node scripts/oddsbot.mjs approval-status <approval_id>
+  node scripts/oddsbot.mjs approvals
+  ```
+
+  If the user set an "ask me before orders above $X" threshold, an order
+  above it is parked and the `order` response has `error:
+  "pending_approval"` plus `approval` (`approval_id`, `expires_at`,
+  `summary`). Tell the user to open their OddsBot dashboard and approve or
+  reject it there (15-minute window), then poll `approval-status`. Its
+  `status` becomes `placed` (with `order` = the real placement result),
+  `failed` (with `placement_error` — a guardrail can still refuse at
+  approval time), `rejected`, or `expired`. Approval places the order at
+  that moment's book through every normal check. `approvals` lists all of
+  the account's held orders.
 
 - Place a market order with an explicit slippage bound (same safety
   contract — confirm the worst-case cost in chat first):
@@ -422,11 +569,14 @@ no OddsBot API endpoint can move funds.
   node scripts/oddsbot.mjs api <METHOD> </path> [--json '<body>']
   ```
 
-- Log out (delete local credentials):
+- Log out (revokes the grant server-side, then deletes local credentials):
 
   ```
   node scripts/oddsbot.mjs logout
   ```
+
+  The response's `server_revoked` says whether the server confirmed the
+  revocation; a later login is a fresh grant either way.
 
 ## Troubleshooting
 
@@ -442,3 +592,11 @@ no OddsBot API endpoint can move funds.
   fresh grant includes the current default scopes.
 - `"onboarded": false` in a response → relay the `guidance` field; the user
   must complete onboarding in the webapp. Do not retry until they have.
+- HTTP 429 `rate_limited` on login → too many device/token requests from
+  this address in a minute; wait for `Retry-After` seconds, never loop.
+- Exit code 42 right after a refresh, with "reuse detected" in the server
+  reply → the credentials file was copied and used elsewhere, and the whole
+  grant was revoked for safety. Tell the user; a fresh login is the only
+  way back.
+- HTTP 403 `trading_paused` → the user paused all agent trading in OddsBot
+  settings. Do not retry or poll; reads and cancels still work.
