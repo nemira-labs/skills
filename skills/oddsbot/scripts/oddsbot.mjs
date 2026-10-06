@@ -7,7 +7,9 @@
 
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -15,65 +17,46 @@ import {
 } from 'node:fs'
 import { hostname } from 'node:os'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
+import { createHash, randomBytes } from 'node:crypto'
 
-// Each agent harness (Claude Code, OpenClaw, a custom runtime, ...) gets its
-// own credentials file and therefore its own OddsBot agent identity — two
-// harnesses on the same machine must not share a grant. Detection is
-// best-effort from well-known env vars; ODDSBOT_HARNESS overrides.
-function detectHarness() {
-  const override = process.env.ODDSBOT_HARNESS
-  const raw =
-    override ||
-    (process.env.CLAUDECODE || process.env.CLAUDE_CODE_ENTRYPOINT
-      ? 'claude-code'
-      : Object.keys(process.env).some((k) => k.startsWith('OPENCLAW'))
-        ? 'openclaw'
-        : process.env.CURSOR_TRACE_ID
-          ? 'cursor'
-          : Object.keys(process.env).some((k) => k.startsWith('CODEX_'))
-            ? 'codex'
-            : process.env.GEMINI_CLI
-              ? 'gemini-cli'
-              : 'custom')
-  const slug = raw
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 40)
-  return slug || 'custom'
-}
-
-const HARNESS = detectHarness()
-const CRED_DIR = process.env.ODDSBOT_STATE_DIR || join(homedir(), '.oddsbot')
+// Each install of the skill is its own OddsBot agent instance with its own
+// credentials, name and grant: installing the skill into Claude Code, Codex
+// and Pi on one machine yields three agents, each named by the user on first
+// login. An instance is keyed by the path the skill runs from (symlinks kept,
+// so per-harness links into one shared copy stay separate). ODDSBOT_INSTANCE
+// names an instance explicitly; ODDSBOT_STATE_DIR points one integration at
+// its own isolated directory.
+const STATE_ROOT = join(homedir(), '.oddsbot')
 // Pre-rebrand location (the skill shipped as "polyedge" until 0.8.x). Moved
-// wholesale, once, so existing logins survive the rename.
+// wholesale, once, so existing state survives the rename.
 const PRE_REBRAND_CRED_DIR = join(homedir(), '.polyedge')
-if (!process.env.ODDSBOT_STATE_DIR && existsSync(PRE_REBRAND_CRED_DIR) && !existsSync(CRED_DIR)) {
+if (!process.env.ODDSBOT_STATE_DIR && existsSync(PRE_REBRAND_CRED_DIR) && !existsSync(STATE_ROOT)) {
   try {
-    renameSync(PRE_REBRAND_CRED_DIR, CRED_DIR)
+    renameSync(PRE_REBRAND_CRED_DIR, STATE_ROOT)
   } catch {
     // fall through: worst case is a fresh login
   }
 }
-const CRED_PATH = join(CRED_DIR, `credentials.${HARNESS}.json`)
-const PENDING_PATH = join(CRED_DIR, `pending-device.${HARNESS}.json`)
-const LEGACY_CRED_PATH = join(CRED_DIR, 'credentials.json')
+const SKILL_ROOT = resolve(dirname(process.argv[1] ?? '.'), '..')
+function instanceKey() {
+  const named = (process.env.ODDSBOT_INSTANCE ?? '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40)
+  return named || createHash('sha256').update(SKILL_ROOT).digest('hex').slice(0, 16)
+}
+const CRED_DIR = process.env.ODDSBOT_STATE_DIR || join(STATE_ROOT, 'instances', instanceKey())
+const CRED_PATH = join(CRED_DIR, 'credentials.json')
+const PENDING_PATH = join(CRED_DIR, 'pending-device.json')
+// Survives logout: the instance id lets a re-login continue the same agent.
+const INSTANCE_PATH = join(CRED_DIR, 'instance.json')
+const CLIENT_NAME = `oddsbot-skill@${hostname()}`
 // The hosted OddsBot service. A stored credentials file pins the base it
 // was issued against; ODDSBOT_API_URL overrides both (local dev:
 // http://localhost:3000).
 const DEFAULT_API_BASE = 'https://oddsbot.vercel.app'
 const EXIT_UNAUTHENTICATED = 42
-
-// One-time migration from the pre-harness layout: the single shared file was
-// one identity, so the first harness that runs claims it.
-if (existsSync(LEGACY_CRED_PATH) && !existsSync(CRED_PATH)) {
-  try {
-    renameSync(LEGACY_CRED_PATH, CRED_PATH)
-  } catch {
-    // fall through: worst case is a fresh login
-  }
-}
+// Keep in sync with the `version` in SKILL.md; declared with each manifest.
+const SKILL_VERSION = '0.14.0'
+const NAME_MAX = 60
 
 function readJsonFile(path) {
   try {
@@ -85,7 +68,7 @@ function readJsonFile(path) {
 
 function writeJsonFile(path, data) {
   mkdirSync(CRED_DIR, { recursive: true, mode: 0o700 })
-  const temporary = `${path}.${process.pid}.tmp`
+  const temporary = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`
   writeFileSync(temporary, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 })
   renameSync(temporary, path)
 }
@@ -94,69 +77,168 @@ function removeFile(path) {
   rmSync(path, { force: true })
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson)
+  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalJson(value[key])]))
+  return value
+}
+
 function apiBase() {
-  return (
+  return apiOrigin(
     process.env.ODDSBOT_API_URL ||
     readJsonFile(CRED_PATH)?.api_base ||
     DEFAULT_API_BASE
-  ).replace(/\/$/, '')
+  )
 }
 
-function die(message, code = 1) {
-  process.stderr.write(message.endsWith('\n') ? message : message + '\n')
-  process.exit(code)
+function apiOrigin(value) {
+  const url = new URL(value)
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+  if (url.username || url.password || url.search || url.hash || url.pathname !== '/' ||
+      (url.protocol !== 'https:' && !(local && url.protocol === 'http:'))) {
+    die('OddsBot requires an HTTPS origin, or HTTP on localhost.')
+  }
+  return url.origin
 }
+
+class CliError extends Error {
+  constructor(message, code, details) { super(message); this.code = code; this.details = details }
+}
+
+function die(message, code = 1, details) {
+  throw new CliError(message, code, details)
+}
+
+const RECOVER_UNKNOWN = 'Read the diagnostic and check the request or connection. Reconcile any earlier mutation before retrying; do not replace an unresolved order intent.'
 
 function die42() {
   die(
     'Not authenticated with OddsBot.\n' +
-      'Run `oddsbot.mjs login --no-poll`, have the user open the printed URL ' +
-      'and approve, then run `oddsbot.mjs login --wait`.',
+      'Run `oddsbot.mjs login --no-poll` (a first login also needs --name "<alias>" ' +
+      'or --auto-name), have the user open the printed URL and approve, then run ' +
+      '`oddsbot.mjs login --code <CODE>` with the code the browser shows.',
     EXIT_UNAUTHENTICATED,
+    { error: 'not_authenticated', next_action: 'Verify the configured server and original account, then use the login flow. Preserve saved receipts and reconcile unresolved intents before placing another order.' },
   )
 }
 
-async function post(path, body) {
+async function readApiResponse(response, method = 'GET') {
+  let result
+  try {
+    result = method === 'HEAD' || response.status === 204
+      ? { http_status: response.status } : JSON.parse(await response.text())
+  }
+  catch (error) {
+    // A truncated body is still an interrupted request, including after HTTP 200.
+    if (!(error instanceof SyntaxError)) throw error
+    return { successful: false, result: { error: 'invalid_response', state: 'unknown',
+      http_status: response.status, next_action: RECOVER_UNKNOWN } }
+  }
+  if (response.ok) return { successful: true, result }
+  const details = result && typeof result === 'object' && !Array.isArray(result) ? result : {}
+  return { successful: false, result: { ...details,
+    error: typeof details.error === 'string' && details.error ? details.error : 'http_error',
+    state: typeof details.state === 'string' && details.state ? details.state : 'unknown',
+    next_action: typeof details.next_action === 'string' && details.next_action ? details.next_action : RECOVER_UNKNOWN,
+    http_status: response.status,
+  } }
+}
+
+async function post(path, body, origin = apiBase()) {
   let response
   try {
-    response = await fetch(apiBase() + path, {
+    response = await fetch(origin + path, {
+      redirect: 'error',
+      signal: AbortSignal.timeout(20_000),
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     })
   } catch (error) {
     die(
-      `Cannot reach OddsBot at ${apiBase()} (${error.cause?.code ?? error.message}).\n` +
+      `Cannot reach OddsBot at ${origin} (${error.cause?.code ?? error.message}).\n` +
         'Check the network, or set ODDSBOT_API_URL if OddsBot lives elsewhere (e.g. http://localhost:3000 for local dev).',
+      1, { error: 'connection_failed' },
     )
   }
   const data = await response.json().catch(() => null)
   return { status: response.status, data }
 }
 
-async function refreshCredentials() {
+// mkdir is atomic across CLI processes. Never steal a lock on a timer: a
+// suspended process might still rotate the token after another one takes over.
+async function withCredentialLock(work) {
+  return withStateLock(CRED_PATH, work)
+}
+
+async function withStateLock(statePath, work) {
+  mkdirSync(CRED_DIR, { recursive: true, mode: 0o700 })
+  const lock = `${statePath}.lock`
+  const deadline = Date.now() + 30_000
+  while (true) {
+    try { mkdirSync(lock, { mode: 0o700 }); break }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error
+      if (Date.now() >= deadline) die(`Another OddsBot command holds ${lock}. If it crashed, verify it has stopped before removing that lock directory. Do not replace an unresolved order.`)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+  }
+  try {
+    writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, hostname: hostname() }), { mode: 0o600 })
+    return await work()
+  } finally { rmSync(lock, { recursive: true, force: true }) }
+}
+
+async function connectionIdentity(origin) {
+  return withCredentialLock(async () => {
+    const creds = readJsonFile(CRED_PATH)
+    if (!creds?.access_token || apiOrigin(creds.api_base) !== origin) die42()
+    if (creds.connection_id) return creds.connection_id
+    const id = crypto.randomUUID()
+    writeJsonFile(CRED_PATH, { ...creds, connection_id: id })
+    return id
+  })
+}
+
+async function refreshCredentials(rejectedToken, origin, connectionId) {
+  return withCredentialLock(async () => {
   const creds = readJsonFile(CRED_PATH)
   if (!creds?.refresh_token) die42()
+  if (apiOrigin(creds.api_base) !== origin || creds.connection_id !== connectionId) die42()
+  const fresh = Date.parse(creds.access_token_expires_at) - 30_000 > Date.now()
+  if (fresh && (!rejectedToken || creds.access_token !== rejectedToken)) return creds
+  const requestId = creds.refresh_request_id ?? crypto.randomUUID()
+  writeJsonFile(CRED_PATH, { ...creds, refresh_request_id: requestId })
   const { status, data } = await post('/api/agent-auth/token', {
     grant_type: 'refresh_token',
     refresh_token: creds.refresh_token,
-  })
+    request_id: requestId,
+  }, apiOrigin(creds.api_base))
   if (status >= 500 || status === 429) {
-    die('OddsBot is temporarily unavailable. Your connection is saved; try again shortly.')
+    die('OddsBot is temporarily unavailable. Your connection is saved; try again shortly.', 1,
+      { error: 'connection_failed', http_status: status,
+        next_action: 'Keep the saved connection and retry the read later. Reconcile any unresolved order with its original intent before another submission.' })
   }
   if (status !== 200 || !data?.access_token) {
-    removeFile(CRED_PATH)
     die42()
   }
   saveTokenResponse(creds, data)
   return readJsonFile(CRED_PATH)
+  })
 }
 
 function saveTokenResponse(existing, data) {
+  if (typeof data.access_token !== 'string' || !data.access_token ||
+      typeof data.refresh_token !== 'string' || !data.refresh_token ||
+      !Number.isFinite(data.expires_in) || data.expires_in <= 0 ||
+      typeof data.scope !== 'string') {
+    die('Invalid token response. Your previous connection is saved.')
+  }
   writeJsonFile(CRED_PATH, {
     api_base: existing?.api_base ?? apiBase(),
-    client_name: existing?.client_name ?? `${HARNESS}@${hostname()}`,
-    harness: HARNESS,
+    connection_id: existing?.connection_id ?? crypto.randomUUID(),
+    ...(existing?.device_session_id ? { device_session_id: existing.device_session_id } : {}),
+    client_name: existing?.client_name ?? CLIENT_NAME,
     access_token: data.access_token,
     access_token_expires_at: new Date(
       Date.now() + data.expires_in * 1000,
@@ -166,21 +248,52 @@ function saveTokenResponse(existing, data) {
   })
 }
 
-async function ensureAccessToken() {
+async function ensureAccessToken(origin, connectionId) {
   let creds = readJsonFile(CRED_PATH)
   if (!creds?.access_token) die42()
-  if (creds.api_base?.replace(/\/$/, '') !== apiBase()) die42()
+  if (apiOrigin(creds.api_base) !== origin || creds.connection_id !== connectionId) die42()
   const expiresAt = Date.parse(creds.access_token_expires_at ?? '') || 0
   if (expiresAt - 30_000 < Date.now()) {
-    creds = await refreshCredentials()
+    creds = await refreshCredentials(undefined, origin, connectionId)
   }
   return creds.access_token
 }
 
-async function apiFetch(method, path, jsonBody) {
-  let token = await ensureAccessToken()
+function agentApiUrl(path, origin) {
+  const url = new URL(path, origin)
+  if (!path.startsWith('/api/v1/') || url.origin !== origin ||
+      !url.pathname.startsWith('/api/v1/') || url.hash ||
+      /\\|%2e|%2f|%5c|%25/i.test(path.split('?')[0]) || path.split('?')[0].split('/').includes('..')) {
+    die('Agent API calls must stay within /api/v1/ on the connected OddsBot server.')
+  }
+  return url
+}
+
+function agentApiRoute(url) {
+  return decodeURIComponent(url.pathname).replace(/\/{2,}/g, '/').replace(/\/$/, '')
+}
+
+async function apiFetch(method, path, jsonBody, origin = apiBase(), connectionId) {
+  const url = agentApiUrl(path, origin)
+  connectionId ??= await connectionIdentity(origin)
+  let token = await ensureAccessToken(origin, connectionId)
+  if (method === 'POST' && agentApiRoute(url) === '/api/v1/polymarket/orders') {
+    const capabilitiesResponse = await apiFetch('GET', '/api/v1/capabilities', undefined, origin, connectionId)
+    const capabilities = await capabilitiesResponse.json().catch(() => null)
+    if (!capabilitiesResponse.ok || capabilities?.api_contract !== 2 ||
+        !Array.isArray(capabilities.features) ||
+        !['exchange_identity_before_signing', 'wallet_configuration_before_signing'].every((feature) => capabilities.features.includes(feature)) ||
+        capabilities.issuer !== origin) {
+      return Response.json({ error: 'backend_incompatible', state: 'nothing_placed',
+        next_action: 'The deployed backend does not support this CLI order contract. Update the backend and verify its issuer before submitting this intent.' }, { status: 503 })
+    }
+    // The capability read may have refreshed the shared credentials.
+    token = await ensureAccessToken(origin, connectionId)
+  }
   const doFetch = (accessToken) =>
-    fetch(apiBase() + path, {
+    fetch(url.href, {
+      redirect: 'error',
+      signal: AbortSignal.timeout(70_000),
       method,
       headers: {
         authorization: `Bearer ${accessToken}`,
@@ -189,11 +302,11 @@ async function apiFetch(method, path, jsonBody) {
       ...(jsonBody !== undefined ? { body: JSON.stringify(jsonBody) } : {}),
     })
   let response = await doFetch(token)
-  if (response.status === 401) {
-    token = (await refreshCredentials()).access_token
+  const authError = response.status === 401 ? await response.clone().json().catch(() => null) : null
+  if (response.status === 401 && authError?.error === 'invalid_token') {
+    token = (await refreshCredentials(token, origin, connectionId)).access_token
     response = await doFetch(token)
     if (response.status === 401) {
-      removeFile(CRED_PATH)
       die42()
     }
   }
@@ -216,7 +329,7 @@ async function cmdStatus() {
         client_name: me.client_name,
         agent_id: me.agent_id,
         agent_name: me.display_name,
-        harness: HARNESS,
+        instance: CRED_DIR,
         scopes: me.scopes,
         privy_did: me.privy_did,
       },
@@ -226,153 +339,422 @@ async function cmdStatus() {
   )
 }
 
-const DEFAULT_SCOPES = ['profile:read', 'wallet:read', 'polymarket:read']
+const DEFAULT_SCOPES = ['profile:read', 'wallet:read', 'polymarket:read', 'agents:write']
 
-async function cmdLoginStart(withTrade = false) {
+// The instance is the stable part of the agent's identity: its id outlives
+// logout so a re-login continues the same agent, name and track record.
+function readInstance() {
+  const saved = readJsonFile(INSTANCE_PATH)
+  if (typeof saved?.instance_id === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(saved.instance_id)) return saved
+  const created = { instance_id: randomBytes(16).toString('base64url'), install_path: SKILL_ROOT, created_at: new Date().toISOString() }
+  writeJsonFile(INSTANCE_PATH, created)
+  return created
+}
+
+function validName(value) {
+  const name = String(value ?? '').trim()
+  if (!name || name.length > NAME_MAX || /\p{Cc}/u.test(name)) {
+    die(`Agent names are 1-${NAME_MAX} characters without control characters.`, 1,
+      { error: 'invalid_name', next_action: 'Ask the user for a shorter name, or omit it to keep the current one.' })
+  }
+  return name
+}
+
+// First login of an instance must say what the user wants it called: an
+// alias (--name) or a generated cool one (--auto-name). Later logins keep the
+// agent's current name unless --name changes it.
+async function cmdLoginStart(withTrade = false, output = process.stdout, naming = {}) {
+  return withCredentialLock(async () => {
+  const origin = apiBase()
+  const instance = readInstance()
+  const displayName = naming.name === undefined ? null : validName(naming.name)
+  if (displayName === null && !naming.auto && !instance.connected_at && !readJsonFile(CRED_PATH)) {
+    die('Name this agent instance before its first login.', 1, {
+      error: 'name_required',
+      next_action: 'Ask the user what to call this agent (it identifies this install on the OddsBot dashboard), then run `oddsbot.mjs login --no-poll --name "<alias>"`. If they have no preference, run `oddsbot.mjs login --no-poll --auto-name` for a generated name such as neuro-reaver-76.',
+    })
+  }
   const pending = readJsonFile(PENDING_PATH)
   if (
     pending?.api_base === apiBase() &&
     Date.parse(pending.expires_at) > Date.now() &&
     pending.with_trade === withTrade &&
+    (pending.display_name ?? null) === displayName &&
     pending.verification_uri_complete
   ) {
-    return printPending(pending)
+    validateVerificationUrl(pending.verification_uri_complete, origin, pending.user_code)
+    return printPending(pending, output)
   }
-  const { status, data } = await post('/api/agent-auth/device', {
-    client_name: `${HARNESS}@${hostname()}`,
-    harness: HARNESS,
+  const scopes = withTrade ? [...DEFAULT_SCOPES, 'polymarket:trade'] : DEFAULT_SCOPES
+  const start = (requested) => post('/api/agent-auth/device', {
+    client_name: CLIENT_NAME,
     hostname: hostname(),
-    scopes: withTrade
-      ? [...DEFAULT_SCOPES, 'polymarket:trade']
-      : DEFAULT_SCOPES,
-  })
-  if (status !== 200 || !data?.device_code) {
-    die(`Failed to start device authorization: ${JSON.stringify(data)}`)
+    instance_id: instance.instance_id,
+    ...(displayName ? { display_name: displayName } : {}),
+    scopes: requested,
+  }, origin)
+  let { status, data } = await start(scopes)
+  // A server older than manifest declarations rejects agents:write; log in without it.
+  if (status === 400 && data?.error === 'invalid_scope') ({ status, data } = await start(scopes.filter((scope) => scope !== 'agents:write')))
+  if (status !== 200 || typeof data?.device_code !== 'string' || !data.device_code ||
+      typeof data.user_code !== 'string' || !/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(data.user_code) ||
+      !Number.isInteger(data.expires_in) || data.expires_in <= 0 || data.expires_in > 3600) {
+    die('Failed to start device authorization: unexpected server response. Your previous connection is saved.')
   }
+  validateVerificationUrl(data.verification_uri_complete, origin, data.user_code)
   const next = {
-    api_base: apiBase(),
+    api_base: origin,
     device_code: data.device_code,
-    interval: data.interval ?? 5,
     expires_at: new Date(Date.now() + data.expires_in * 1000).toISOString(),
     verification_uri_complete: data.verification_uri_complete,
     user_code: data.user_code,
     with_trade: withTrade,
-    next_poll_at: Date.now() + (data.interval ?? 5) * 1000,
+    display_name: displayName,
   }
   writeJsonFile(PENDING_PATH, next)
-  printPending(next)
+  printPending(next, output)
+  })
 }
 
-function printPending(pending) {
-  console.log(
+function validateVerificationUrl(value, origin, code) {
+  const url = new URL(value)
+  if (url.origin !== origin || url.username || url.password || url.hash ||
+      url.pathname !== '/activate' || url.searchParams.get('code') !== code ||
+      [...url.searchParams.keys()].some((key) => key !== 'code') || url.searchParams.getAll('code').length !== 1) {
+    die('OddsBot returned an untrusted authorization URL. No authorization was started.', 1,
+      { error: 'untrusted_authorization_url', next_action: 'Check the configured OddsBot server. Do not open this authorization link.' })
+  }
+}
+
+function printPending(pending, output) {
+  if (output.isTTY) {
+    output.write(
+      `\nOpen this link in your browser and approve the request:\n\n  ${pending.verification_uri_complete}\n\n` +
+      `Check that the page shows the code ${pending.user_code}. After you approve, it shows an approval code.\n`,
+    )
+    return
+  }
+  output.write(
     JSON.stringify(
       {
         verification_uri_complete: pending.verification_uri_complete,
         user_code: pending.user_code,
         expires_in: Math.max(0, Math.ceil((Date.parse(pending.expires_at) - Date.now()) / 1000)),
         next_step:
-          'Ask the user to open the URL and approve, then run `oddsbot.mjs login --wait`.',
+          'Ask the user to open the URL, check it shows the same user_code, and approve. ' +
+          'The browser then shows an approval code (XXXX-XXXX-XXXX). Ask the user to paste it back, ' +
+          'then run `oddsbot.mjs login --code <CODE>`. Never guess or invent the code.',
       },
       null,
       2,
-    ),
+    ) + '\n',
   )
 }
 
-async function cmdLoginPoll() {
-  const pending = readJsonFile(PENDING_PATH)
-  if (!pending?.device_code || pending.api_base !== apiBase()) {
-    console.log(JSON.stringify({ authenticated: false, state: 'not_started' }))
-    return
-  }
-  if (Date.parse(pending.expires_at) <= Date.now()) {
-    removeFile(PENDING_PATH)
-    console.log(JSON.stringify({ authenticated: false, state: 'expired' }))
-    return
-  }
-  if (pending.next_poll_at > Date.now()) {
-    console.log(JSON.stringify({ authenticated: false, state: 'pending', retry_after_seconds: Math.ceil((pending.next_poll_at - Date.now()) / 1000) }))
-    return
-  }
-  const { status, data } = await post('/api/agent-auth/token', {
-    grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-    device_code: pending.device_code,
-  })
-  if (status === 200 && data?.access_token) {
-    saveTokenResponse({ api_base: pending.api_base }, data)
-    removeFile(PENDING_PATH)
-    console.log(JSON.stringify({ authenticated: true, state: 'connected', scopes: (data.scope ?? '').split(' ') }))
-    return
-  }
-  const interval = (pending.interval ?? 5) + (data?.error === 'slow_down' ? 5 : 0)
-  if (['authorization_pending', 'slow_down'].includes(data?.error) || status >= 500) {
-    writeJsonFile(PENDING_PATH, { ...pending, interval, next_poll_at: Date.now() + interval * 1000 })
-    console.log(JSON.stringify({ authenticated: false, state: 'pending', retry_after_seconds: interval }))
-    return
-  }
-  removeFile(PENDING_PATH)
-  console.log(JSON.stringify({ authenticated: false, state: data?.error === 'access_denied' ? 'denied' : 'expired' }))
+function deviceSessionId(pending) {
+  return createHash('sha256').update(pending.device_code).digest('hex')
 }
 
-async function cmdLoginWait() {
-  const pending = readJsonFile(PENDING_PATH)
-  if (!pending?.device_code) {
-    die('No pending device authorization. Run `oddsbot.mjs login --no-poll` first.')
+// Same alphabet and shape as the server's approval codes; checked locally so
+// a typo does not spend one of the session's few attempts.
+const APPROVAL_CODE_CHARSET = 'BCDFGHJKLMNPQRSTVWXZ'
+function normalizeApprovalCode(value) {
+  const chars = String(value ?? '').toUpperCase().replace(/[\s-]/g, '')
+  if (!new RegExp(`^[${APPROVAL_CODE_CHARSET}]{12}$`).test(chars)) {
+    die('That is not an OddsBot approval code. It looks like XXXX-XXXX-XXXX and appears in the browser after approving.', 1,
+      { error: 'invalid_approval_code', next_action: 'Ask the user to copy the approval code shown in the browser after approving, then run `oddsbot.mjs login --code <CODE>` again.' })
   }
-  if (pending.api_base !== apiBase()) die('Pending authorization belongs to another OddsBot server. Restart login.')
-  let interval = (pending.interval ?? 5) * 1000
-  const expiresAt = Date.parse(pending.expires_at ?? '') || Date.now() + 900_000
+  return `${chars.slice(0, 4)}-${chars.slice(4, 8)}-${chars.slice(8)}`
+}
 
-  while (Date.now() < expiresAt) {
-    await new Promise((resolve) => setTimeout(resolve, interval))
-    const { data } = await post('/api/agent-auth/token', {
+// Exchanges the pending device_code plus the code the user pasted from the
+// browser for tokens. Neither half works alone. Returns { authenticated }
+// on success, or { state, error, message } the caller can act on.
+async function exchangeApprovalCode(rawCode) {
+  const code = normalizeApprovalCode(rawCode)
+  return withCredentialLock(async () => {
+    const pending = readJsonFile(PENDING_PATH)
+    const creds = readJsonFile(CRED_PATH)
+    if (!pending?.device_code) {
+      if (creds?.access_token && creds.device_session_id && creds.api_base === apiBase()) {
+        return { authenticated: true, state: 'connected', scopes: creds.scopes }
+      }
+      die('No pending login. Run `oddsbot.mjs login --no-poll` first.', 1,
+        { error: 'login_not_started', next_action: 'Start a login with `oddsbot.mjs login --no-poll`, have the user approve in the browser, then pass the code it shows to `oddsbot.mjs login --code <CODE>`.' })
+    }
+    if (pending.api_base !== apiBase()) die('Pending authorization belongs to another OddsBot server. Restart login.')
+    const expiresAt = Date.parse(pending.expires_at)
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      removeFile(PENDING_PATH)
+      return { authenticated: false, state: 'expired', message: 'This login request expired. Start the login again.' }
+    }
+    const { status, data } = await post('/api/agent-auth/token', {
       grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
       device_code: pending.device_code,
-    })
-    if (data?.access_token) {
-      saveTokenResponse(readJsonFile(CRED_PATH), data)
+      approval_code: code,
+    }, apiOrigin(pending.api_base))
+    if (status === 200 && data?.access_token) {
+      saveTokenResponse({ api_base: pending.api_base, device_session_id: deviceSessionId(pending) }, data)
       removeFile(PENDING_PATH)
-      console.log(
-        JSON.stringify(
-          { authenticated: true, scopes: (data.scope ?? '').split(' ') },
-          null,
-          2,
-        ),
-      )
-      return
+      writeJsonFile(INSTANCE_PATH, { ...readInstance(), connected_at: new Date().toISOString() })
+      return { authenticated: true, state: 'connected', scopes: data.scope.split(' ').filter(Boolean) }
     }
-    switch (data?.error) {
-      case 'authorization_pending':
-        continue
-      case 'slow_down':
-        interval += 5000 // RFC 8628 §3.5
-        continue
-      case 'access_denied':
-        removeFile(PENDING_PATH)
-        die('The user denied the authorization request.')
-        break
-      case 'expired_token':
-        removeFile(PENDING_PATH)
-        die('The device code expired before approval. Restart the login flow.')
-        break
-      default:
-        removeFile(PENDING_PATH)
-        die(`Device authorization failed: ${JSON.stringify(data)}`)
+    if (status >= 500 || status === 429 || data?.error === 'temporarily_unavailable') {
+      return { authenticated: false, state: 'unavailable', message: 'OddsBot is temporarily unavailable. The login is still pending; enter the same code again shortly.' }
+    }
+    if (data?.error === 'authorization_pending') {
+      return { authenticated: false, state: 'not_approved', message: 'The request is not approved yet. Approve it in the browser, then enter the code it shows.' }
+    }
+    if (data?.error === 'invalid_grant' && Number.isInteger(data.attempts_left)) {
+      return { authenticated: false, state: 'incorrect_code', attempts_left: data.attempts_left,
+        message: `That code does not match this login (${data.attempts_left} attempts left). Check it and try again.` }
+    }
+    if (['access_denied', 'expired_token', 'invalid_grant'].includes(data?.error)) {
+      removeFile(PENDING_PATH)
+      return { authenticated: false, state: data.error === 'access_denied' ? 'denied' : 'expired',
+        message: data.error === 'access_denied' ? 'The login was denied or locked after too many wrong codes. Start the login again.' : 'This login request expired or was already used. Start the login again.' }
+    }
+    die('Device authorization returned an unexpected response. Your pending authorization and previous connection are saved; retry later.')
+  })
+}
+
+const RETRYABLE_LOGIN_STATES = ['incorrect_code', 'not_approved', 'unavailable']
+
+async function cmdLoginCode(code) {
+  const result = await exchangeApprovalCode(code)
+  if (result.authenticated) { console.log(JSON.stringify(await connectedResult(result))); return }
+  die(result.message, 1, {
+    error: result.state,
+    ...(result.attempts_left === undefined ? {} : { attempts_left: result.attempts_left }),
+    next_action: RETRYABLE_LOGIN_STATES.includes(result.state)
+      ? 'Ask the user for the approval code shown in the browser after approving, then run `oddsbot.mjs login --code <CODE>` again. Never guess the code.'
+      : 'Start a new login with `oddsbot.mjs login --no-poll` and send the user the new URL.',
+  })
+}
+
+// Interactive login: the user approves in the browser and pastes the code it
+// shows back here, like `gh auth login` or `gcloud auth login`.
+async function cmdLoginInteractive() {
+  const { createInterface } = await import('node:readline/promises')
+  const prompt = createInterface({ input: process.stdin, output: process.stderr, terminal: true })
+  try {
+    const closed = new Promise((resolve) => prompt.once('close', () => resolve(null)))
+    while (true) {
+      const line = await Promise.race([prompt.question('\nPaste the approval code shown in your browser: '), closed])
+      if (line === null) {
+        die('Login not finished. The request stays pending; finish it with `oddsbot.mjs login --code <CODE>`.', 1,
+          { error: 'login_cancelled', next_action: 'Run `oddsbot.mjs login --code <CODE>` with the approval code the browser shows after approving.' })
+      }
+      const answer = line.trim()
+      if (!answer) continue
+      let result
+      try {
+        result = await exchangeApprovalCode(answer)
+      } catch (error) {
+        if (error instanceof CliError && error.details?.error === 'invalid_approval_code') {
+          process.stderr.write(`${error.message}\n`)
+          continue
+        }
+        throw error
+      }
+      if (result.authenticated) { console.log(JSON.stringify(await connectedResult(result))); return }
+      if (!RETRYABLE_LOGIN_STATES.includes(result.state)) die(result.message, 1, { error: result.state, next_action: 'Run `oddsbot.mjs login` again.' })
+      process.stderr.write(`${result.message}\n`)
+    }
+  } finally {
+    prompt.close()
+  }
+}
+
+/** After approval: which agent this instance is, and its manifest declaration. Never fails the login. */
+async function connectedResult(result) {
+  let agent = null
+  try {
+    const response = await apiFetch('GET', '/api/v1/me')
+    const me = await response.json().catch(() => null)
+    if (response.ok && typeof me?.agent_id === 'string') agent = { agent_id: me.agent_id, agent_name: me.display_name }
+  } catch {
+    // the connection is saved; `status` shows the name later
+  }
+  return { ...result, ...(agent ? { agent, next_step: 'Tell the user this agent is connected as its agent_name. They can rename it any time with `oddsbot.mjs name "<new name>"` or on the agents page of their OddsBot dashboard.' } : {}),
+    manifest: await autoDeclareManifest() }
+}
+
+// --- agent package & strategy manifest ---
+//
+// An agent package is the directory holding `oddsbot-agent.json`. Its manifest
+// hash covers every regular file below it except dot-entries and node_modules:
+// sorted POSIX relative paths (byte order), each with the SHA-256 of its raw
+// bytes. The same tree hashes identically on any machine. It is an honest
+// agent's self-declaration, not proof of the code that actually runs.
+const AGENT_PACKAGE_FILE = 'oddsbot-agent.json'
+const MANIFEST_MAX_FILES = 2000
+const MANIFEST_MAX_BYTES = 20 * 1024 * 1024
+
+function findAgentPackage(explicit) {
+  const configured = explicit ?? process.env.ODDSBOT_AGENT_DIR
+  if (configured) {
+    const root = resolve(configured)
+    if (!existsSync(join(root, AGENT_PACKAGE_FILE))) die(`No ${AGENT_PACKAGE_FILE} in ${root}.`, 1,
+      { error: 'agent_package_not_found', next_action: 'Point --dir or ODDSBOT_AGENT_DIR at the agent package, or run `oddsbot.mjs agent init <dir>`.' })
+    return root
+  }
+  for (let dir = process.cwd(); ; dir = dirname(dir)) {
+    if (existsSync(join(dir, AGENT_PACKAGE_FILE))) return dir
+    if (dirname(dir) === dir) return null
+  }
+}
+
+function agentPackageConfig(root) {
+  let config
+  try { config = JSON.parse(readFileSync(join(root, AGENT_PACKAGE_FILE), 'utf8')) }
+  catch { die(`${AGENT_PACKAGE_FILE} is not valid JSON.`, 1, { error: 'invalid_agent_package', next_action: `Fix ${join(root, AGENT_PACKAGE_FILE)}.` }) }
+  const text = (value, max) => typeof value === 'string' && value.trim() && value.length <= max && /^[\x20-\x7e]+$/.test(value) ? value.trim() : undefined
+  if (!config || typeof config !== 'object' || Array.isArray(config)) die(`${AGENT_PACKAGE_FILE} must be a JSON object.`)
+  return { name: text(config.name, 60), version: text(config.version, 64), model: text(config.model, 100) }
+}
+
+function manifestFiles(root) {
+  const files = []
+  let bytes = 0
+  const walk = (dir) => {
+    for (const name of readdirSync(dir)) {
+      if (name.startsWith('.') || name === 'node_modules') continue
+      const path = join(dir, name)
+      const stat = lstatSync(path)
+      const rel = relative(root, path).split(sep).join('/')
+      if (stat.isSymbolicLink()) die(`Agent packages cannot contain symbolic links: ${rel}`, 1, { error: 'invalid_agent_package', next_action: 'Replace the link with the file it points to.' })
+      if (stat.isDirectory()) { walk(path); continue }
+      if (!stat.isFile()) continue
+      bytes += stat.size
+      if (files.length >= MANIFEST_MAX_FILES || bytes > MANIFEST_MAX_BYTES) die('The agent package exceeds 2000 files or 20 MB.', 1, { error: 'agent_package_too_large', next_action: 'Keep only the agent definition in the package.' })
+      files.push({ path: rel, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') })
     }
   }
-  removeFile(PENDING_PATH)
-  die('The device code expired before approval. Restart the login flow.')
+  walk(root)
+  return files.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)))
+}
+
+function manifestHash(files) {
+  const hash = createHash('sha256')
+  for (const file of files) hash.update(`${file.path}\0${file.sha256}\n`)
+  return `sha256:${hash.digest('hex')}`
+}
+
+function detectModelId(config) {
+  const value = process.env.ODDSBOT_MODEL_ID || config.model || process.env.ANTHROPIC_MODEL || process.env.CLAUDE_MODEL ||
+    process.env.OPENAI_MODEL || process.env.GEMINI_MODEL
+  return typeof value === 'string' && value.trim() && value.length <= 100 && /^[\x20-\x7e]+$/.test(value) ? value.trim() : null
+}
+
+function computeManifest(root) {
+  const config = agentPackageConfig(root)
+  const files = manifestFiles(root)
+  return { package_root: root, name: config.name ?? null, manifest_hash: manifestHash(files), file_count: files.length,
+    version_label: config.version ?? null, model_id: detectModelId(config), skill_version: SKILL_VERSION, files }
+}
+
+async function declareManifest(manifest) {
+  const body = { manifest_hash: manifest.manifest_hash, file_count: manifest.file_count, skill_version: SKILL_VERSION,
+    ...(manifest.version_label ? { version_label: manifest.version_label } : {}), ...(manifest.model_id ? { model_id: manifest.model_id } : {}) }
+  const response = await apiFetch('POST', '/api/v1/agents/manifest', body)
+  const data = await response.json().catch(() => null)
+  if (response.status === 403) die('This login cannot declare manifests.', 1, { error: 'insufficient_scope', next_action: 'Run `oddsbot.mjs login` again; new logins include the agents:write scope.' })
+  if (!response.ok || !data?.version) die(`Manifest declaration failed (${response.status}).`, 1, { error: data?.error ?? 'declare_failed', next_action: data?.next_action ?? 'Retry `oddsbot.mjs manifest --declare` shortly.' })
+  return data
+}
+
+async function cmdManifest(argv) {
+  const dirAt = argv.indexOf('--dir')
+  const root = findAgentPackage(dirAt === -1 ? undefined : argv[dirAt + 1])
+  if (!root) die(`No agent package found. Create one with \`oddsbot.mjs agent init <dir>\`, or add ${AGENT_PACKAGE_FILE} to the agent's directory.`, 1,
+    { error: 'agent_package_not_found', next_action: 'Run from inside the agent package or pass --dir.' })
+  const { files, ...manifest } = computeManifest(root)
+  const output = { ...manifest, ...(argv.includes('--files') ? { files } : {}) }
+  if (!argv.includes('--declare')) { console.log(JSON.stringify(output, null, 2)); return }
+  if (!readJsonFile(CRED_PATH)) die42()
+  const declared = await declareManifest(manifest)
+  console.log(JSON.stringify({ ...output, declared: { agent_id: declared.agent_id, changed: declared.changed, epoch: declared.version.epoch } }, null, 2))
+}
+
+/** Declares after login when an agent package is present; never fails the login. */
+async function autoDeclareManifest() {
+  try {
+    const root = findAgentPackage()
+    if (!root) return { declared: false, reason: 'no_agent_package' }
+    const declared = await declareManifest(computeManifest(root))
+    return { declared: true, agent_id: declared.agent_id, changed: declared.changed, epoch: declared.version.epoch, manifest_hash: declared.version.manifest_hash }
+  } catch (error) {
+    return { declared: false, reason: error instanceof CliError ? error.details?.error ?? error.message : 'declare_failed',
+      next_action: 'Run `oddsbot.mjs manifest --declare` from the agent package.' }
+  }
+}
+
+const SCAFFOLD_SKILL = (name) => `---
+name: ${name}
+description: >-
+  Trading strategy for the "${name}" OddsBot agent. Use when asked to look for
+  or act on Polymarket opportunities for this agent.
+---
+
+# ${name}
+
+This package is the agent's strategy. Every file here is part of its manifest:
+editing any of them changes the manifest hash and starts a new version on the
+OddsBot leaderboard after the next \`oddsbot.mjs manifest --declare\` or login.
+
+All market access goes through the OddsBot skill's CLI (\`oddsbot.mjs\`). Never
+call Polymarket directly and never handle wallet keys.
+
+## Loop
+
+1. Read the rules in \`strategy/rules.md\`.
+2. Discover candidates: \`oddsbot.mjs events <query> --sort trending\`.
+3. Inspect each candidate: \`oddsbot.mjs market <id>\` and \`oddsbot.mjs book <token_id>\`.
+4. Quote before trading: \`oddsbot.mjs quote <token_id> buy <size>@<price>\`.
+5. Only place orders that satisfy every rule: \`oddsbot.mjs order <token_id> buy <size>@<price>\`.
+6. Record why you traded or skipped.
+`
+
+const SCAFFOLD_RULES = `# Strategy rules
+
+Replace these with your strategy. Keep them explicit; they are what the
+manifest versions.
+
+- Only trade markets that resolve within 7 days.
+- Only buy when your estimated probability exceeds the best ask by 5 points.
+- Never exceed the per-order and daily limits the user approved in OddsBot.
+`
+
+function cmdAgentInit(argv) {
+  const [sub, target] = argv
+  if (sub !== 'init' || !target) die('Usage: oddsbot.mjs agent init <dir> [--name <name>]')
+  const nameAt = argv.indexOf('--name')
+  const root = resolve(target)
+  const name = (nameAt === -1 ? root.split(sep).pop() : argv[nameAt + 1]) ?? 'agent'
+  if (!/^[a-z0-9][a-z0-9-]{1,59}$/.test(name)) die('Agent names use 2-60 lowercase letters, digits and hyphens.', 1, { error: 'invalid_name', next_action: 'Pass --name my-agent.' })
+  if (existsSync(root) && readdirSync(root).length) die(`${root} is not empty.`, 1, { error: 'directory_not_empty', next_action: 'Choose a new directory for the agent package.' })
+  mkdirSync(join(root, 'strategy'), { recursive: true })
+  writeFileSync(join(root, AGENT_PACKAGE_FILE), JSON.stringify({ name, version: '0.1.0' }, null, 2) + '\n')
+  writeFileSync(join(root, 'SKILL.md'), SCAFFOLD_SKILL(name))
+  writeFileSync(join(root, 'strategy', 'rules.md'), SCAFFOLD_RULES)
+  const { files, ...manifest } = computeManifest(root)
+  console.log(JSON.stringify({ created: files.map((file) => file.path), ...manifest,
+    next_step: `From ${root}, run \`oddsbot.mjs login --name "<alias>"\` (or --auto-name). The manifest is declared automatically after approval; tick "Show this agent on the public leaderboard" there to list it.` }, null, 2))
 }
 
 // Logout revokes the grant server-side (RFC 7009, by refresh token) before
 // deleting local state, so a logged-out credential file is dead even if a
 // copy of it exists somewhere. Best-effort: offline still logs out locally.
 async function cmdLogout() {
+  return withCredentialLock(async () => {
   const creds = readJsonFile(CRED_PATH)
   let serverRevoked = false
   if (creds?.refresh_token) {
     try {
-      const response = await fetch(apiBase() + '/api/agent-auth/revoke', {
+      const response = await fetch(apiOrigin(creds.api_base) + '/api/agent-auth/revoke', {
+        redirect: 'error',
+        signal: AbortSignal.timeout(20_000),
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ token: creds.refresh_token }),
@@ -386,6 +768,25 @@ async function cmdLogout() {
   removeFile(CRED_PATH)
   removeFile(PENDING_PATH)
   console.log(JSON.stringify({ logged_out: true, server_revoked: serverRevoked }))
+  })
+}
+
+// `name`: this agent's current display name. `name <new name>`: renames it
+// on the server (also renamable on the dashboard's agents page).
+async function cmdName(words) {
+  if (!readJsonFile(CRED_PATH)) die42()
+  if (!words.length) {
+    const response = await apiFetch('GET', '/api/v1/me')
+    const me = await response.json().catch(() => null)
+    if (!response.ok || !me) die('Could not read this agent. Try again shortly.')
+    console.log(JSON.stringify({ agent_id: me.agent_id, agent_name: me.display_name, instance: CRED_DIR }, null, 2))
+    return
+  }
+  const response = await apiFetch('POST', '/api/v1/agents/name', { display_name: validName(words.join(' ')) })
+  const data = await response.json().catch(() => null)
+  if (response.status === 403) die('This login cannot rename its agent.', 1, { error: 'insufficient_scope', next_action: 'Rename it on the agents page of the OddsBot dashboard, or run `oddsbot.mjs login` again; new logins include the agents:write scope.' })
+  if (!response.ok || typeof data?.display_name !== 'string') die(`Rename failed (${response.status}).`, 1, { error: data?.error ?? 'rename_failed', reason: data?.reason, next_action: data?.next_action ?? 'Retry shortly, or rename it on the dashboard.' })
+  console.log(JSON.stringify({ agent_id: data.agent_id, agent_name: data.display_name, renamed: true }, null, 2))
 }
 
 async function cmdApi(argv) {
@@ -401,10 +802,107 @@ async function cmdApi(argv) {
       die('--json value is not valid JSON')
     }
   }
-  const response = await apiFetch(method.toUpperCase(), path, body)
-  const text = await response.text()
-  console.log(text)
-  process.exit(response.ok ? 0 : 1)
+  const origin = apiBase()
+  const route = agentApiRoute(agentApiUrl(path, origin))
+  const connectionId = await connectionIdentity(origin)
+  const orderPost = method.toUpperCase() === 'POST' && route === '/api/v1/polymarket/orders'
+  const statusIntent = method.toUpperCase() === 'GET' ? /^\/api\/v1\/polymarket\/intents\/([\w.:-]{8,128})$/.exec(route)?.[1] : undefined
+  let receiptPath
+  const intentId = orderPost ? body?.intent_id : statusIntent
+  if (orderPost || statusIntent) {
+    if (typeof intentId !== 'string' || !/^[\w.:-]{8,128}$/.test(intentId)) die('An order requires an intent_id of 8–128 characters (letters, digits, ._:-)')
+    const directory = join(CRED_DIR, 'intents')
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const key = createHash('sha256').update(JSON.stringify([origin, intentId])).digest('hex')
+    receiptPath = join(directory, `${key}.json`)
+    if (orderPost) {
+      const prepared = await withStateLock(receiptPath, async () => {
+        const saved = readJsonFile(receiptPath)
+        if (existsSync(receiptPath) && (!saved || saved.api_base !== origin || saved.connection_id !== connectionId || saved.intent_id !== intentId ||
+            JSON.stringify(canonicalJson(saved.body)) !== JSON.stringify(canonicalJson(body)))) return false
+        writeJsonFile(receiptPath, saved ?? { intent_id: intentId, api_base: origin, connection_id: connectionId, body, state: 'unknown', created_at: new Date().toISOString() })
+        return true
+      })
+      if (!prepared) {
+        console.log(JSON.stringify({ error: 'intent_conflict', state: 'unknown', intent_id: intentId,
+          next_action: 'This receipt belongs to another order or connection, or predates connection binding. Reconcile the original account and intent before creating a new order.' }))
+        process.exitCode = 1
+        return
+      }
+      process.stderr.write(`Order intent ${intentId} saved in ${receiptPath}\n`)
+    } else if (readJsonFile(receiptPath)?.connection_id !== connectionId) receiptPath = undefined
+  }
+  let response
+  let result
+  let successful
+  try {
+    response = await apiFetch(method.toUpperCase(), path, body, origin, connectionId)
+    const received = await readApiResponse(response, method.toUpperCase())
+    result = received.result
+    successful = received.successful
+  }
+  catch (error) {
+    if (!receiptPath) throw error
+    const interrupted = { error: 'order_request_interrupted', state: 'unknown', intent_id: intentId,
+      receipt_path: receiptPath, next_action: 'Reconcile this intent_id. Do not submit a new intent: the order may have reached the exchange.' }
+    const saved = await recordIntentAttempt(receiptPath, { result: interrupted })
+    console.log(JSON.stringify({ ...interrupted, ...(acceptedOrder(saved.result) ? { known_result: saved.result } : {}) }))
+    process.exitCode = error instanceof CliError ? error.code : 1
+    return
+  }
+  if (receiptPath) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) result = { error: 'invalid_order_response', state: 'unknown', intent_id: intentId }
+    const saved = await recordIntentAttempt(receiptPath, { result, http_status: response.status })
+    const latest = saved.last_attempt.result
+    result = { ...latest, ...(acceptedOrder(saved.result) && saved.result !== latest ? { known_result: saved.result } : {}) }
+    if (latest.state === 'unknown') successful = false
+  }
+  console.log(JSON.stringify(result))
+  process.exitCode = successful ? 0 : 1
+}
+
+function acceptedOrder(result) {
+  return result?.ok === true && typeof result.order_id === 'string' && result.order_id.length > 0 &&
+    typeof result.replay === 'boolean' && typeof result.status === 'string' && Number.isFinite(result.notional_usd)
+}
+
+function finalizedBlock(result) {
+  const proof = result?.reconciliation
+  return proof?.filled === true && proof.order_hash === result.order_id && proof.remaining === '0' &&
+    typeof proof.block_number === 'string' && /^\d{1,78}$/.test(proof.block_number) ? BigInt(proof.block_number) : null
+}
+
+async function recordIntentAttempt(path, attempt) {
+  return withStateLock(path, async () => {
+    const saved = readJsonFile(path)
+    if (!saved?.intent_id || !saved.body) die('The saved order receipt cannot be verified. Reconcile the original intent; do not create a replacement order.')
+    let result = attempt.result
+    const refusal = result?.ok === false && typeof result.replay === 'boolean' && typeof result.reason === 'string' &&
+      typeof result.error === 'string' && ['unknown', 'nothing_placed'].includes(result.state)
+    if ((!acceptedOrder(result) && !refusal) || (result.intent_id !== undefined && result.intent_id !== saved.intent_id)) {
+      result = { error: result?.error ?? 'invalid_order_response', state: 'unknown', intent_id: saved.intent_id,
+        next_action: 'The original intent is still unresolved. Use intent-status; do not create a replacement order.' }
+    }
+    if (refusal && (typeof result.next_action !== 'string' || !result.next_action)) {
+      result = { ...result, next_action: 'Use intent-status to reconcile this intent before doing anything else. Do not create a replacement order while its outcome is unresolved.' }
+    }
+    const previousAccepted = acceptedOrder(saved.result)
+    if (previousAccepted && result.state === 'nothing_placed') {
+      result = { ...result, state: 'unknown', intent_id: saved.intent_id,
+        next_action: 'An earlier response acknowledged this order. Reconcile that order; this retry refusal does not cancel or replace it.' }
+    }
+    if (previousAccepted && acceptedOrder(result) && result.order_id !== saved.result.order_id) {
+      result = { error: 'intent_conflict', state: 'unknown', intent_id: saved.intent_id,
+        next_action: 'The server returned a different order identity for this intent. Stop and reconcile the original order.' }
+    }
+    const previousBlock = finalizedBlock(saved.result)
+    const nextBlock = finalizedBlock(result)
+    const keepPrevious = previousAccepted && (!acceptedOrder(result) || (previousBlock !== null && (nextBlock === null || nextBlock < previousBlock)))
+    const updated = { ...saved, ...(keepPrevious ? {} : { result, state: result.state === 'unknown' ? 'unknown' : 'response_received', http_status: attempt.http_status }),
+      last_attempt: { ...attempt, result, received_at: new Date().toISOString() } }
+    writeJsonFile(path, updated)
+    return updated
+  })
 }
 
 function flagValue(argv, flag) {
@@ -465,10 +963,10 @@ function cmdBook(argv) {
     words.push(argv[i])
   }
   const tokenId = words[0]
-  if (!/^\d+$/.test(tokenId ?? '')) {
+  if (!/^\d{1,100}$/.test(tokenId ?? '')) {
     die(
       'Usage: oddsbot.mjs book <token_id> [--depth N] [--json]\n' +
-        'The token_id is the numeric `token_id` from `market <id>` output.',
+        'Use the numeric token ID from `market <id>` output.',
     )
   }
   const depth = flagValue(argv, '--depth')
@@ -476,7 +974,7 @@ function cmdBook(argv) {
   return cmdApi(['GET', `/api/v1/polymarket/book/${tokenId}${suffix}`])
 }
 
-// `history <token_id>`: CLOB trade-price history for one outcome token —
+// `history <token_id>`: CLOB historical price samples for one outcome token —
 // strategy input, NOT a live quote (use `book` / `market` for that).
 function cmdHistory(argv) {
   const words = []
@@ -488,11 +986,11 @@ function cmdHistory(argv) {
     if (argv[i] === '--json') continue
     words.push(argv[i])
   }
-  const tokenId = words[0]
-  if (!/^\d+$/.test(tokenId ?? '')) {
+  const tokenIds = (words[0] ?? '').split(',')
+  if (tokenIds.length > 20 || new Set(tokenIds).size !== tokenIds.length || tokenIds.some((id) => !/^\d{1,100}$/.test(id))) {
     die(
       'Usage: oddsbot.mjs history <token_id> [--interval 1h|6h|1d|1w|max] [--fidelity <minutes>] [--json]\n' +
-        'The token_id is the numeric `token_id` from `market <id>` output.',
+        'Use 1–20 unique comma-separated numeric token IDs from `market <id>` output.',
     )
   }
   const params = new URLSearchParams()
@@ -500,8 +998,12 @@ function cmdHistory(argv) {
   if (interval) params.set('interval', interval)
   const fidelity = flagValue(argv, '--fidelity')
   if (fidelity) params.set('fidelity', fidelity)
+  if (tokenIds.length > 1) {
+    params.set('token_ids', tokenIds.join(','))
+    return cmdApi(['GET', `/api/v1/polymarket/history?${params}`])
+  }
   const suffix = params.size > 0 ? `?${params}` : ''
-  return cmdApi(['GET', `/api/v1/polymarket/history/${tokenId}${suffix}`])
+  return cmdApi(['GET', `/api/v1/polymarket/history/${tokenIds[0]}${suffix}`])
 }
 
 // `events [query]`: search or browse events — the groupings agents reason
@@ -557,9 +1059,13 @@ async function cmdPositions(argv) {
       apiFetch('GET', `/api/v1/polymarket/positions${suffix}`),
       apiFetch('GET', `/api/v1/polymarket/positions/closed${suffix}`),
     ])
-    const [open, closed] = await Promise.all([openRes.json(), closedRes.json()])
-    process.stdout.write(JSON.stringify({ open, closed }, null, 2) + '\n')
-    if (!openRes.ok || !closedRes.ok) process.exit(1)
+    const [open, closed] = await Promise.all([readApiResponse(openRes), readApiResponse(closedRes)])
+    const successful = open.successful && closed.successful
+    process.stdout.write(JSON.stringify({ open: open.result, closed: closed.result,
+      ...(!successful ? { error: 'incomplete_positions', state: 'unknown',
+        next_action: 'The combined positions result is incomplete. Resolve the failed read before using it to make trading decisions.' } : {}),
+    }, null, 2) + '\n')
+    process.exitCode = successful ? 0 : 1
     return
   }
   const path = argv.includes('--closed')
@@ -575,7 +1081,8 @@ async function cmdPositions(argv) {
 // cover the size within it. The server enforces the user's spend limits; a
 // refused order must never be retried in smaller pieces (see SKILL.md
 // safety contract).
-async function cmdOrder(argv) {
+async function cmdOrder(argv, prepareOnly = false) {
+  const endpoint = prepareOnly ? '/api/v1/polymarket/quotes' : '/api/v1/polymarket/orders'
   const words = []
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--intent' || argv[i] === '--max-slippage') {
@@ -629,7 +1136,7 @@ async function cmdOrder(argv) {
     }
     return cmdApi([
       'POST',
-      '/api/v1/polymarket/orders',
+      endpoint,
       JSON.stringify({
         type: 'market',
         intent_id: intentId,
@@ -645,7 +1152,7 @@ async function cmdOrder(argv) {
   }
   return cmdApi([
     'POST',
-    '/api/v1/polymarket/orders',
+    endpoint,
     JSON.stringify({
       intent_id: intentId,
       token_id: tokenId,
@@ -675,7 +1182,7 @@ function cmdApprovalStatus(argv) {
 // --- analytics (first-party Data API reads) ---
 
 function cmdHolders(argv) {
-  const cond = argv.find((a) => !a.startsWith('-'))
+  const cond = (argv[0]?.startsWith('--') ? undefined : argv[0])
   if (!/^0x[0-9a-fA-F]{64}$/.test(cond ?? '')) {
     die('Usage: oddsbot.mjs holders <condition_id> [--limit N]   (0x… condition_id from `market <id>`)')
   }
@@ -719,7 +1226,7 @@ function cmdLeaderboard(argv) {
 }
 
 function cmdPortfolio(argv) {
-  const address = argv.find((a) => !a.startsWith('-'))
+  const address = (argv[0]?.startsWith('--') ? undefined : argv[0])
   if (!/^0x[0-9a-fA-F]{40}$/.test(address ?? '')) {
     die('Usage: oddsbot.mjs portfolio <0x address> [--limit N]   (any wallet, e.g. from `leaderboard`)')
   }
@@ -748,14 +1255,14 @@ function cmdTags(argv) {
 }
 
 function cmdTag(argv) {
-  const id = argv.find((a) => !a.startsWith('-'))
+  const id = (argv[0]?.startsWith('--') ? undefined : argv[0])
   if (!id) die('Usage: oddsbot.mjs tag <slug|id> [--limit N]   (e.g. `tag nba`)')
   const limit = flagValue(argv, '--limit')
   return cmdApi(['GET', `/api/v1/polymarket/tags/${encodeURIComponent(id)}${limit ? `?limit=${encodeURIComponent(limit)}` : ''}`])
 }
 
 function cmdSeries(argv) {
-  const id = argv.find((a) => !a.startsWith('-'))
+  const id = (argv[0]?.startsWith('--') ? undefined : argv[0])
   const limit = flagValue(argv, '--limit')
   const cursor = flagValue(argv, '--cursor')
   if (id) {
@@ -768,7 +1275,7 @@ function cmdSeries(argv) {
 }
 
 function cmdTeams(argv) {
-  const league = argv.find((a) => !a.startsWith('-'))
+  const league = (argv[0]?.startsWith('--') ? undefined : argv[0])
   if (!league) die('Usage: oddsbot.mjs teams <league> [--limit N]   (league slug from `sports`, e.g. nfl)')
   const limit = flagValue(argv, '--limit')
   const params = new URLSearchParams({ league })
@@ -834,14 +1341,23 @@ Usage: oddsbot.mjs <command>
 
 Commands:
   status                        Print auth state (exit 42 if not authenticated)
-  login                         Start device authorization and wait for approval
-  login --no-poll               Start device authorization, print URL + code, exit
-  login --wait                  Poll until the pending authorization is approved
-  login --poll-once             Check pending authorization once without blocking
+  capabilities                  Verify backend contract, schema and readiness
+  login                         Start authorization and prompt for the approval
+                                code the browser shows (needs a terminal; without
+                                one it behaves like --no-poll)
+  login --no-poll               Start authorization, print URL + code, exit
+  login --code <CODE>           Finish the pending login with the approval code
+                                the browser showed after the user approved
   login --trade                 Include the polymarket:trade scope in the request
                                 (combinable with --no-poll; needs the user's
                                 explicit agreement FIRST — see SKILL.md)
-  logout                        Delete local credentials
+  login --name "<alias>"        Name this agent instance (required on its first
+                                login unless --auto-name; renames on later ones)
+  login --auto-name             First login with a generated name (neuro-reaver-76)
+  logout                        Revoke this instance's grant and delete its
+                                credentials (the instance keeps its agent id)
+  name                          This agent's current name
+  name "<new name>"             Rename this agent (1-60 characters)
   api <METHOD> </path> [--json '<body>']
                                 Authenticated API call, response body to stdout
   balance                       Real pUSD balance of the user's Polymarket wallet
@@ -858,7 +1374,7 @@ Commands:
                                 cumulative USD depth, midpoint, spread, tick
                                 size, min size, neg_risk
   history <token_id> [--interval 1h|6h|1d|1w|max] [--fidelity <min>] [--json]
-                                Trade-price history for one outcome token
+                                Trade-price history; comma-separate up to 20 token IDs
                                 (default window 1d) with first/last/change/
                                 high/low. Not a live quote — see \`book\`.
   events [query] [--limit N] [--cursor C] [--sort trending|newest] [--tag <slug>]
@@ -889,6 +1405,7 @@ Commands:
                                 and redeemable=true on resolved markets
   positions --closed            Closed positions with realized P&L
   positions --all               Both, as {"open": …, "closed": …}
+  quote <token_id> buy|sell <size>@<price> [--intent ID]  Prepare expiring terms without placing an order; @market also supported
   order <token_id> buy|sell <size>@<price> [--post-only] [--intent ID]
                                 Place a real-money limit order (requires the
                                 polymarket:trade scope and user confirmation).
@@ -911,12 +1428,14 @@ Commands:
                                 HTTP 202 / "pending_approval": the order is
                                 above the user's confirmation threshold and
                                 held until they approve it on their dashboard.
-  approval-status <approval_id> State of a held order (pending / placed /
-                                rejected / expired) — poll after a 202
+  approval-status <approval_id> State of a held order (pending / approved /
+                                placed / failed / rejected / expired).
+                                Approved without an outcome stays unknown.
   orders                        The user's open orders
   order-status <order_id>       One order's live state: status, size matched /
                                 remaining, trade ids — poll this instead of
                                 the whole list
+  intent-status <intent_id>     Recover a saved order intent after an interrupted request
   cancel <order_id>             Cancel an open order
   cancel --all [--token <id> | --market <condition_id>]
                                 Cancel every open order, or only those on one
@@ -927,36 +1446,135 @@ Commands:
                                 expiry, ALL the user's open orders are
                                 canceled. Renew well inside the TTL.
   heartbeat --status            Lease state (armed, seconds_left, last end)
-  heartbeat --off               Disarm = cancel all open orders NOW
+  heartbeat --off               Stop pump and request cancel-all; check the result
   trades                        The user's trade history (fills)
+  manifest [--dir <path>] [--files]
+                                Strategy manifest hash of the agent package
+                                (directory with oddsbot-agent.json)
+  manifest --declare            Declare the manifest; a changed hash opens a
+                                new version on the leaderboard
+  agent init <dir> [--name <name>]
+                                Scaffold a new agent package in an empty dir
 
 Environment:
   ODDSBOT_API_URL              API base URL (default ${DEFAULT_API_BASE};
                                 use http://localhost:3000 for local dev)
-  ODDSBOT_HARNESS              Override the detected harness name (this run:
-                                ${HARNESS})
+  ODDSBOT_AGENT_DIR            Agent package directory (default: nearest
+                                parent with oddsbot-agent.json)
+  ODDSBOT_MODEL_ID             Model id declared with the manifest
+  ODDSBOT_INSTANCE             Name this instance's state explicitly instead of
+                                keying it by the skill's install path
   ODDSBOT_STATE_DIR            Isolated credential directory for integrations
 
-Credentials are stored per harness in ~/.oddsbot/credentials.<harness>.json
-(0600) — each harness the skill runs in is a separate OddsBot agent with its
-own name and grant. Logout revokes the grant server-side (best effort) and
-clears local state; the user can also revoke any grant in the OddsBot web app.`
+Every install of the skill is its own OddsBot agent: its state lives in
+~/.oddsbot/instances/<key>/ (this run: ${CRED_DIR}), keyed by the path the
+skill runs from, with credentials.json at 0600. The user names each instance
+on its first login. Logout revokes the grant server-side (best effort) and
+clears the credentials; the user can also rename or revoke any agent in the
+OddsBot web app.`
+
+// Validate the entire command before authentication or any network access.
+// Canonical positionals-first output keeps every handler independent of where
+// the caller placed its options.
+function parseCommand(command, argv) {
+  const paging = { '--limit': 'value', '--cursor': 'value' }
+  const discovery = { ...paging, '--sort': 'value', '--tag': 'value' }
+  const schemas = {
+    help: [0, 0, {}], '--help': [0, 0, {}],
+    status: [0, 0, {}], capabilities: [0, 0, {}], logout: [0, 0, {}], balance: [0, 0, {}],
+    orders: [0, 0, {}], trades: [0, 0, {}], approvals: [0, 0, {}], sports: [0, 0, {}],
+    login: [0, 0, { '--trade': 'boolean', '--no-poll': 'boolean', '--code': 'value', '--name': 'value', '--auto-name': 'boolean' }],
+    name: [0, Infinity, {}],
+    api: [2, 2, { '--json': 'value' }],
+    markets: [0, Infinity, discovery], events: [0, Infinity, discovery],
+    market: [1, 1, {}], event: [1, 1, {}],
+    book: [1, 1, { '--depth': 'value' }],
+    history: [1, 1, { '--interval': 'value', '--fidelity': 'value' }],
+    positions: [0, 0, { '--all': 'boolean', '--closed': 'boolean', '--limit': 'value', '--offset': 'value' }],
+    order: [3, 3, { '--intent': 'value', '--max-slippage': 'value', '--wait': 'optional-number', '--post-only': 'boolean', '--allow-off-market': 'boolean' }],
+    quote: [3, 3, { '--intent': 'value', '--max-slippage': 'value', '--post-only': 'boolean', '--allow-off-market': 'boolean' }],
+    'approval-status': [1, 1, {}], 'order-status': [1, 1, {}], 'intent-status': [1, 1, {}],
+    holders: [1, 1, { '--limit': 'value' }], 'open-interest': [1, 1, {}], 'live-volume': [1, 1, {}],
+    leaderboard: [0, 0, { '--window': 'value', '--by': 'value', '--category': 'value', '--limit': 'value' }],
+    portfolio: [1, 1, { '--limit': 'value' }], tags: [0, Infinity, paging],
+    tag: [1, 1, { '--limit': 'value' }], series: [0, 1, paging], teams: [1, 1, { '--limit': 'value' }],
+    cancel: [0, 1, { '--all': 'boolean', '--token': 'value', '--market': 'value' }],
+    heartbeat: [0, 0, { '--status': 'boolean', '--off': 'boolean', '--ttl': 'value' }],
+    manifest: [0, 0, { '--dir': 'value', '--declare': 'boolean', '--files': 'boolean' }],
+    agent: [2, 2, { '--name': 'value' }],
+  }
+  const schema = schemas[command]
+  if (!schema) return argv
+  const [min, max, options] = schema
+  const words = []
+  const flags = new Map()
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('-')) { words.push(arg); continue }
+    const kind = arg === '--json' && command !== 'api' ? 'boolean' : options[arg]
+    if (!kind) die(`Unknown option for ${command}: ${arg}`)
+    if (flags.has(arg)) die(`Duplicate option: ${arg}`)
+    if (kind === 'value') {
+      const value = argv[++i]
+      if (value === undefined || value === '' || value.startsWith('--')) die(`${arg} requires a value`)
+      flags.set(arg, value)
+    } else if (kind === 'optional-number' && /^\d+$/.test(argv[i + 1] ?? '')) {
+      flags.set(arg, argv[++i])
+    } else { flags.set(arg, true) }
+  }
+  if (words.length < min || words.length > max) die(`Invalid arguments for ${command}. Run oddsbot.mjs --help.`)
+  const exclusive = (names) => {
+    if (names.filter((name) => flags.has(name)).length > 1) die(`${names.join(', ')} are mutually exclusive`)
+  }
+  if (command === 'login') {
+    exclusive(['--code', '--no-poll'])
+    exclusive(['--name', '--auto-name'])
+    for (const flag of ['--trade', '--name', '--auto-name']) {
+      if (flags.has(flag) && flags.has('--code')) die(`${flag} must be given when starting login`)
+    }
+  }
+  if (command === 'positions') exclusive(['--all', '--closed'])
+  if (command === 'heartbeat') exclusive(['--status', '--off', '--ttl'])
+  if (command === 'cancel') {
+    exclusive(['--token', '--market'])
+    if (flags.has('--all') ? words.length !== 0 : words.length !== 1) die('Use cancel <order_id> or cancel --all with an optional filter')
+    if (!flags.has('--all') && (flags.has('--token') || flags.has('--market'))) die('Cancellation filters require --all')
+  }
+  if (command === 'series' && words.length && flags.has('--cursor')) die('--cursor is for series listings')
+  if (['order', 'quote'].includes(command) && flags.has('--max-slippage') && !words[2].endsWith('@market')) die('--max-slippage requires @market')
+  for (const flag of ['--limit', '--offset', '--depth', '--fidelity', '--max-slippage', '--ttl']) {
+    if (!flags.has(flag)) continue
+    const value = flags.get(flag)
+    const lower = ['--offset', '--max-slippage'].includes(flag) ? 0 : 1
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < lower) die(`${flag} requires a whole number of at least ${lower}`)
+  }
+  if (flags.has('--wait') && flags.get('--wait') !== true && Number(flags.get('--wait')) > 60000) die('--wait must be at most 60000 milliseconds')
+  if (command === 'api') {
+    if (!['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'HEAD'].includes(words[0].toUpperCase())) die('Unsupported API method')
+    return [...words, ...(flags.has('--json') ? [flags.get('--json')] : [])]
+  }
+  return [...words, ...[...flags].filter(([key]) => key !== '--json').flatMap(([key, value]) => value === true ? [key] : [key, value])]
+}
 
 async function main() {
-  // Every command prints JSON on stdout and prose on stderr; --json is
-  // accepted anywhere for uniformity and means nothing extra.
-  const [command, ...rest] = process.argv.slice(2).filter((arg) => arg !== '--json')
+  const [command, ...raw] = process.argv.slice(2)
+  const rest = parseCommand(command, raw)
   switch (command) {
     case 'status':
       return cmdStatus()
+    case 'capabilities':
+      return cmdApi(['GET', '/api/v1/capabilities'])
     case 'login': {
       const withTrade = rest.includes('--trade')
-      if (rest.includes('--no-poll')) return cmdLoginStart(withTrade)
-      if (rest.includes('--poll-once')) return cmdLoginPoll()
-      if (rest.includes('--wait')) return cmdLoginWait()
-      await cmdLoginStart(withTrade)
-      return cmdLoginWait()
+      const naming = { name: rest.includes('--name') ? rest[rest.indexOf('--name') + 1] : undefined, auto: rest.includes('--auto-name') }
+      if (rest.includes('--code')) return cmdLoginCode(rest[rest.indexOf('--code') + 1])
+      // Agents run without a terminal: they relay the URL and the user's code.
+      if (rest.includes('--no-poll') || !process.stdin.isTTY) return cmdLoginStart(withTrade, process.stdout, naming)
+      await cmdLoginStart(withTrade, process.stderr, naming)
+      return cmdLoginInteractive()
     }
+    case 'name':
+      return cmdName(rest)
     case 'logout':
       return cmdLogout()
     case 'api':
@@ -979,6 +1597,8 @@ async function main() {
       return cmdPositions(rest)
     case 'order':
       return cmdOrder(rest)
+    case 'quote':
+      return cmdOrder(rest, true)
     case 'approval-status':
       return cmdApprovalStatus(rest)
     case 'approvals':
@@ -1007,20 +1627,34 @@ async function main() {
       return cmdApi(['GET', '/api/v1/polymarket/orders'])
     case 'order-status':
       return cmdOrderStatus(rest)
+    case 'intent-status':
+      if (!/^[\w.:-]{8,128}$/.test(rest[0])) die('Invalid intent_id')
+      return cmdApi(['GET', `/api/v1/polymarket/intents/${encodeURIComponent(rest[0])}`])
     case 'cancel':
       return cmdCancel(rest)
     case 'heartbeat':
       return cmdHeartbeat(rest)
     case 'trades':
       return cmdApi(['GET', '/api/v1/polymarket/trades'])
+    case 'manifest':
+      return cmdManifest(rest)
+    case 'agent':
+      return cmdAgentInit(rest)
     case 'help':
     case '--help':
     case undefined:
-      console.log(HELP)
+      console.log(raw.includes('--json') ? JSON.stringify({ help: HELP }) : HELP)
       return
     default:
       die(`Unknown command: ${command}\n\n${HELP}`)
   }
 }
 
-main().catch((error) => die(String(error?.stack ?? error)))
+main().catch((error) => {
+  process.stderr.write(String(error?.message ?? error) + '\n')
+  console.log(JSON.stringify({ error: error instanceof CliError ? 'command_failed' : 'request_failed',
+    state: 'unknown', next_action: RECOVER_UNKNOWN,
+    ...(error instanceof CliError ? error.details : {}),
+  }))
+  process.exitCode = error instanceof CliError ? error.code : 1
+})
