@@ -28,16 +28,6 @@ import { createHash, randomBytes } from 'node:crypto'
 // names an instance explicitly; ODDSBOT_STATE_DIR points one integration at
 // its own isolated directory.
 const STATE_ROOT = join(homedir(), '.oddsbot')
-// Pre-rebrand location (the skill shipped as "polyedge" until 0.8.x). Moved
-// wholesale, once, so existing state survives the rename.
-const PRE_REBRAND_CRED_DIR = join(homedir(), '.polyedge')
-if (!process.env.ODDSBOT_STATE_DIR && existsSync(PRE_REBRAND_CRED_DIR) && !existsSync(STATE_ROOT)) {
-  try {
-    renameSync(PRE_REBRAND_CRED_DIR, STATE_ROOT)
-  } catch {
-    // fall through: worst case is a fresh login
-  }
-}
 const SKILL_ROOT = resolve(dirname(process.argv[1] ?? '.'), '..')
 function instanceKey() {
   const named = (process.env.ODDSBOT_INSTANCE ?? '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40)
@@ -51,11 +41,11 @@ const INSTANCE_PATH = join(CRED_DIR, 'instance.json')
 const CLIENT_NAME = `oddsbot-skill@${hostname()}`
 // The hosted OddsBot service. A stored credentials file pins the base it
 // was issued against; ODDSBOT_API_URL overrides both (local dev:
-// http://localhost:3000).
+// http://localhost:3100).
 const DEFAULT_API_BASE = 'https://oddsbot.vercel.app'
 const EXIT_UNAUTHENTICATED = 42
 // Keep in sync with the `version` in SKILL.md; declared with each manifest.
-const SKILL_VERSION = '0.14.0'
+const SKILL_VERSION = '0.15.0'
 const NAME_MAX = 60
 
 function readJsonFile(path) {
@@ -75,6 +65,12 @@ function writeJsonFile(path, data) {
 
 function removeFile(path) {
   rmSync(path, { force: true })
+}
+
+// The settlement wait changes how long a request blocks, not which order it places.
+function receiptBody(body) {
+  const { wait_for_fill_ms: _wait, ...order } = body ?? {}
+  return JSON.stringify(canonicalJson(order))
 }
 
 function canonicalJson(value) {
@@ -157,7 +153,7 @@ async function post(path, body, origin = apiBase()) {
   } catch (error) {
     die(
       `Cannot reach OddsBot at ${origin} (${error.cause?.code ?? error.message}).\n` +
-        'Check the network, or set ODDSBOT_API_URL if OddsBot lives elsewhere (e.g. http://localhost:3000 for local dev).',
+        'Check the network, or set ODDSBOT_API_URL if OddsBot lives elsewhere (e.g. http://localhost:3100 for local dev).',
       1, { error: 'connection_failed' },
     )
   }
@@ -277,7 +273,10 @@ async function apiFetch(method, path, jsonBody, origin = apiBase(), connectionId
   const url = agentApiUrl(path, origin)
   connectionId ??= await connectionIdentity(origin)
   let token = await ensureAccessToken(origin, connectionId)
-  if (method === 'POST' && agentApiRoute(url) === '/api/v1/polymarket/orders') {
+  const orderPost = method === 'POST' && agentApiRoute(url) === '/api/v1/polymarket/orders'
+  // An order may wait up to wait_for_fill_ms for settlement after placement.
+  const timeout = 70_000 + (orderPost && Number.isSafeInteger(jsonBody?.wait_for_fill_ms) ? jsonBody.wait_for_fill_ms : 0)
+  if (orderPost) {
     const capabilitiesResponse = await apiFetch('GET', '/api/v1/capabilities', undefined, origin, connectionId)
     const capabilities = await capabilitiesResponse.json().catch(() => null)
     if (!capabilitiesResponse.ok || capabilities?.api_contract !== 2 ||
@@ -293,7 +292,7 @@ async function apiFetch(method, path, jsonBody, origin = apiBase(), connectionId
   const doFetch = (accessToken) =>
     fetch(url.href, {
       redirect: 'error',
-      signal: AbortSignal.timeout(70_000),
+      signal: AbortSignal.timeout(timeout),
       method,
       headers: {
         authorization: `Bearer ${accessToken}`,
@@ -386,16 +385,13 @@ async function cmdLoginStart(withTrade = false, output = process.stdout, naming 
     return printPending(pending, output)
   }
   const scopes = withTrade ? [...DEFAULT_SCOPES, 'polymarket:trade'] : DEFAULT_SCOPES
-  const start = (requested) => post('/api/agent-auth/device', {
+  const { status, data } = await post('/api/agent-auth/device', {
     client_name: CLIENT_NAME,
     hostname: hostname(),
     instance_id: instance.instance_id,
     ...(displayName ? { display_name: displayName } : {}),
-    scopes: requested,
+    scopes,
   }, origin)
-  let { status, data } = await start(scopes)
-  // A server older than manifest declarations rejects agents:write; log in without it.
-  if (status === 400 && data?.error === 'invalid_scope') ({ status, data } = await start(scopes.filter((scope) => scope !== 'agents:write')))
   if (status !== 200 || typeof data?.device_code !== 'string' || !data.device_code ||
       typeof data.user_code !== 'string' || !/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(data.user_code) ||
       !Number.isInteger(data.expires_in) || data.expires_in <= 0 || data.expires_in > 3600) {
@@ -708,12 +704,16 @@ call Polymarket directly and never handle wallet keys.
 
 ## Loop
 
+Follow the safety contract in the OddsBot skill for every order.
+
 1. Read the rules in \`strategy/rules.md\`.
 2. Discover candidates: \`oddsbot.mjs events <query> --sort trending\`.
 3. Inspect each candidate: \`oddsbot.mjs market <id>\` and \`oddsbot.mjs book <token_id>\`.
-4. Quote before trading: \`oddsbot.mjs quote <token_id> buy <size>@<price>\`.
-5. Only place orders that satisfy every rule: \`oddsbot.mjs order <token_id> buy <size>@<price>\`.
-6. Record why you traded or skipped.
+4. Choose one new intent ID for the order, such as a UUID, and quote it: \`oddsbot.mjs quote <token_id> buy <size>@<price> --intent <intent_id>\`.
+5. Show the quoted terms to the user and wait for explicit confirmation. Skip orders that break a rule.
+6. Before the quote expires, place the same order: \`oddsbot.mjs order <token_id> buy <size>@<price> --intent <intent_id>\`.
+7. If the result is ambiguous, run \`oddsbot.mjs intent-status <intent_id>\` before anything else. Never reuse the intent for a different order.
+8. Record why you traded or skipped.
 `
 
 const SCAFFOLD_RULES = `# Strategy rules
@@ -819,7 +819,7 @@ async function cmdApi(argv) {
       const prepared = await withStateLock(receiptPath, async () => {
         const saved = readJsonFile(receiptPath)
         if (existsSync(receiptPath) && (!saved || saved.api_base !== origin || saved.connection_id !== connectionId || saved.intent_id !== intentId ||
-            JSON.stringify(canonicalJson(saved.body)) !== JSON.stringify(canonicalJson(body)))) return false
+            receiptBody(saved.body) !== receiptBody(body))) return false
         writeJsonFile(receiptPath, saved ?? { intent_id: intentId, api_base: origin, connection_id: connectionId, body, state: 'unknown', created_at: new Date().toISOString() })
         return true
       })
@@ -881,10 +881,10 @@ async function recordIntentAttempt(path, attempt) {
       typeof result.error === 'string' && ['unknown', 'nothing_placed'].includes(result.state)
     if ((!acceptedOrder(result) && !refusal) || (result.intent_id !== undefined && result.intent_id !== saved.intent_id)) {
       result = { error: result?.error ?? 'invalid_order_response', state: 'unknown', intent_id: saved.intent_id,
-        next_action: 'The original intent is still unresolved. Use intent-status; do not create a replacement order.' }
+        next_action: 'The original intent is still unresolved. Read the intent status for this intent_id before anything else; do not create a replacement order.' }
     }
     if (refusal && (typeof result.next_action !== 'string' || !result.next_action)) {
-      result = { ...result, next_action: 'Use intent-status to reconcile this intent before doing anything else. Do not create a replacement order while its outcome is unresolved.' }
+      result = { ...result, next_action: 'Read the intent status for this intent_id to reconcile it before doing anything else. Do not create a replacement order while its outcome is unresolved.' }
     }
     const previousAccepted = acceptedOrder(saved.result)
     if (previousAccepted && result.state === 'nothing_placed') {
@@ -910,7 +910,10 @@ function flagValue(argv, flag) {
   return index !== -1 ? argv[index + 1] : undefined
 }
 
-async function cmdMarkets(argv) {
+// `markets [query]` / `events [query]`: search or browse. Events group the
+// related markets agents reason about ("the Fed meeting"); both share flags
+// and paging.
+function cmdListing(kind, argv) {
   const words = []
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--limit' || argv[i] === '--cursor' || argv[i] === '--sort' || argv[i] === '--tag') {
@@ -921,16 +924,12 @@ async function cmdMarkets(argv) {
   }
   const params = new URLSearchParams()
   if (words.length > 0) params.set('query', words.join(' '))
-  const limit = flagValue(argv, '--limit')
-  if (limit) params.set('limit', limit)
-  const cursor = flagValue(argv, '--cursor')
-  if (cursor) params.set('cursor', cursor)
-  const sort = flagValue(argv, '--sort')
-  if (sort) params.set('sort', sort)
-  const tag = flagValue(argv, '--tag')
-  if (tag) params.set('tag', tag)
+  for (const flag of ['limit', 'cursor', 'sort', 'tag']) {
+    const value = flagValue(argv, `--${flag}`)
+    if (value) params.set(flag, value)
+  }
   const suffix = params.size > 0 ? `?${params}` : ''
-  return cmdApi(['GET', `/api/v1/polymarket/markets${suffix}`])
+  return cmdApi(['GET', `/api/v1/polymarket/${kind}${suffix}`])
 }
 
 // `market <id>`: one market in full, with LIVE order-book quotes per
@@ -1006,31 +1005,6 @@ function cmdHistory(argv) {
   return cmdApi(['GET', `/api/v1/polymarket/history/${tokenIds[0]}${suffix}`])
 }
 
-// `events [query]`: search or browse events — the groupings agents reason
-// about ("the Fed meeting"). Same flags and paging as `markets`.
-function cmdEvents(argv) {
-  const words = []
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--limit' || argv[i] === '--cursor' || argv[i] === '--sort' || argv[i] === '--tag') {
-      i++ // skip the flag's value
-      continue
-    }
-    words.push(argv[i])
-  }
-  const params = new URLSearchParams()
-  if (words.length > 0) params.set('query', words.join(' '))
-  const limit = flagValue(argv, '--limit')
-  if (limit) params.set('limit', limit)
-  const cursor = flagValue(argv, '--cursor')
-  if (cursor) params.set('cursor', cursor)
-  const sort = flagValue(argv, '--sort')
-  if (sort) params.set('sort', sort)
-  const tag = flagValue(argv, '--tag')
-  if (tag) params.set('tag', tag)
-  const suffix = params.size > 0 ? `?${params}` : ''
-  return cmdApi(['GET', `/api/v1/polymarket/events${suffix}`])
-}
-
 // `event <id|slug>`: one event with every nested market. Exact lookup —
 // a typo is a 404, never a different event.
 function cmdEvent(argv) {
@@ -1044,15 +1018,16 @@ function cmdEvent(argv) {
   return cmdApi(['GET', `/api/v1/polymarket/events/${encodeURIComponent(id)}`])
 }
 
-// `positions [--closed | --all] [--limit N] [--offset N]`: open positions
+// `positions [--closed | --all] [--limit N] [--cursor C]`: open positions
 // with unrealized P&L (default), closed positions with realized P&L, or
-// both. Everything comes from Polymarket's Data API at call time.
+// both. Everything comes from Polymarket's Data API at call time. A cursor
+// continues one list, so --all takes none.
 async function cmdPositions(argv) {
   const params = new URLSearchParams()
   const limit = flagValue(argv, '--limit')
   if (limit) params.set('limit', limit)
-  const offset = flagValue(argv, '--offset')
-  if (offset) params.set('offset', offset)
+  const cursor = flagValue(argv, '--cursor')
+  if (cursor) params.set('cursor', cursor)
   const suffix = params.size > 0 ? `?${params}` : ''
   if (argv.includes('--all')) {
     const [openRes, closedRes] = await Promise.all([
@@ -1400,10 +1375,12 @@ Commands:
   portfolio <0x address> [--limit N]
                                 Any wallet's public profile, value and top
                                 open positions
-  positions [--limit N] [--offset N]
+  positions [--limit N] [--cursor C]
                                 Open positions with unrealized P&L, a summary,
-                                and redeemable=true on resolved markets
-  positions --closed            Closed positions with realized P&L
+                                and redeemable=true on resolved markets; pass
+                                next_cursor as --cursor for the next page
+  positions --closed [--cursor C]
+                                Closed positions with realized P&L
   positions --all               Both, as {"open": …, "closed": …}
   quote <token_id> buy|sell <size>@<price> [--intent ID]  Prepare expiring terms without placing an order; @market also supported
   order <token_id> buy|sell <size>@<price> [--post-only] [--intent ID]
@@ -1458,7 +1435,7 @@ Commands:
 
 Environment:
   ODDSBOT_API_URL              API base URL (default ${DEFAULT_API_BASE};
-                                use http://localhost:3000 for local dev)
+                                use http://localhost:3100 for local dev)
   ODDSBOT_AGENT_DIR            Agent package directory (default: nearest
                                 parent with oddsbot-agent.json)
   ODDSBOT_MODEL_ID             Model id declared with the manifest
@@ -1490,7 +1467,7 @@ function parseCommand(command, argv) {
     market: [1, 1, {}], event: [1, 1, {}],
     book: [1, 1, { '--depth': 'value' }],
     history: [1, 1, { '--interval': 'value', '--fidelity': 'value' }],
-    positions: [0, 0, { '--all': 'boolean', '--closed': 'boolean', '--limit': 'value', '--offset': 'value' }],
+    positions: [0, 0, { '--all': 'boolean', '--closed': 'boolean', '--limit': 'value', '--cursor': 'value' }],
     order: [3, 3, { '--intent': 'value', '--max-slippage': 'value', '--wait': 'optional-number', '--post-only': 'boolean', '--allow-off-market': 'boolean' }],
     quote: [3, 3, { '--intent': 'value', '--max-slippage': 'value', '--post-only': 'boolean', '--allow-off-market': 'boolean' }],
     'approval-status': [1, 1, {}], 'order-status': [1, 1, {}], 'intent-status': [1, 1, {}],
@@ -1533,7 +1510,7 @@ function parseCommand(command, argv) {
       if (flags.has(flag) && flags.has('--code')) die(`${flag} must be given when starting login`)
     }
   }
-  if (command === 'positions') exclusive(['--all', '--closed'])
+  if (command === 'positions') { exclusive(['--all', '--closed']); exclusive(['--all', '--cursor']) }
   if (command === 'heartbeat') exclusive(['--status', '--off', '--ttl'])
   if (command === 'cancel') {
     exclusive(['--token', '--market'])
@@ -1542,10 +1519,10 @@ function parseCommand(command, argv) {
   }
   if (command === 'series' && words.length && flags.has('--cursor')) die('--cursor is for series listings')
   if (['order', 'quote'].includes(command) && flags.has('--max-slippage') && !words[2].endsWith('@market')) die('--max-slippage requires @market')
-  for (const flag of ['--limit', '--offset', '--depth', '--fidelity', '--max-slippage', '--ttl']) {
+  for (const flag of ['--limit', '--depth', '--fidelity', '--max-slippage', '--ttl']) {
     if (!flags.has(flag)) continue
     const value = flags.get(flag)
-    const lower = ['--offset', '--max-slippage'].includes(flag) ? 0 : 1
+    const lower = flag === '--max-slippage' ? 0 : 1
     if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < lower) die(`${flag} requires a whole number of at least ${lower}`)
   }
   if (flags.has('--wait') && flags.get('--wait') !== true && Number(flags.get('--wait')) > 60000) die('--wait must be at most 60000 milliseconds')
@@ -1582,7 +1559,7 @@ async function main() {
     case 'balance':
       return cmdApi(['GET', '/api/v1/wallet/balance'])
     case 'markets':
-      return cmdMarkets(rest)
+      return cmdListing('markets', rest)
     case 'market':
       return cmdMarket(rest)
     case 'book':
@@ -1590,7 +1567,7 @@ async function main() {
     case 'history':
       return cmdHistory(rest)
     case 'events':
-      return cmdEvents(rest)
+      return cmdListing('events', rest)
     case 'event':
       return cmdEvent(rest)
     case 'positions':
